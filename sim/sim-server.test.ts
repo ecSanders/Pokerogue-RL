@@ -42,6 +42,7 @@ import { MoveId } from "#enums/move-id";
 import { Nature } from "#enums/nature";
 import { PokeballType } from "#enums/pokeball";
 import { SpeciesId } from "#enums/species-id";
+import { TrainerType } from "#enums/trainer-type";
 import { UiMode } from "#enums/ui-mode";
 import type { EnemyPokemon, Pokemon } from "#field/pokemon";
 import { HealShopCostModifier } from "#modifiers/modifier";
@@ -709,6 +710,8 @@ class Sim {
       wave: battle?.waveIndex ?? 0,
       turn: battle?.turn ?? 0,
       double: battle?.double ?? false,
+      battleType: battle ? BattleType[battle.battleType] : null,
+      trainer: battle?.trainer ? TrainerType[battle.trainer.config.trainerType] : null,
       money: scene.money,
       biome: scene.arena?.biomeId,
       balls: [0, 1, 2, 3, 4].map(b => scene.pokeballCounts[b as PokeballType] ?? 0),
