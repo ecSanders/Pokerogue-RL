@@ -29,6 +29,8 @@ def team_summary(party: list[dict]) -> dict:
         "hp": round(sum(p["hp"] for p in alive) / max(sum(p["maxHp"] for p in alive), 1), 3),
         "levels": [p["level"] for p in party],
         "bst": [p["bst"] for p in party],
+        "shiny": sum(p["shiny"] for p in party),
+        "pokerus": sum(p["pokerus"] for p in party),
     }
 
 
@@ -130,6 +132,8 @@ def summarize(records: list[dict]) -> None:
           f"below half in {pct(sum(s['hp'] < 0.5 for s in starts), len(starts))}")
     print(f"  top level: median {statistics.median(max(s['levels']) for s in starts)}, "
           f"level spread (max-min) median {statistics.median(max(s['levels']) - min(s['levels']) for s in starts)}")
+    print(f"  Pokerus carriers: {dict(sorted(Counter(s['pokerus'] for s in starts).items()))}")
+    print(f"  shinies: {dict(sorted(Counter(s['shiny'] for s in starts).items()))}")
 
     print("\nlevel gap (enemy max level - our max level) by wave decade, all runs:")
     gaps = defaultdict(list)

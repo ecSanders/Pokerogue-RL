@@ -15,7 +15,9 @@
  *   reward         index into obs.options (rewards, shop items, reroll, skip)
  *   reward_target  party slot to receive the chosen item
  *   learn_move     0-3 = replace that move slot with obs.learn.move, 4 = don't learn
- * Remaining inputs (faint switches, biome choice, prompts) are handled by scripted defaults in
+ *   faint_switch   party slot to send in after a faint
+ *   release        party full after a catch: 0-5 = release that slot to keep obs.caught, 6 = let it go
+ * Remaining inputs (biome choice, double-battle targets, prompts) are handled by scripted defaults in
  * `watchdogTick` and counted in `info.autoInputs`.
  *
  * Only runs when RL_PORT is set, so normal `pnpm test` runs skip it.
@@ -26,13 +28,14 @@
  */
 
 import { BattleScene } from "#app/battle-scene";
-import { PLAYER_PARTY_MAX_SIZE } from "#app/constants";
 import { getGameMode } from "#app/game-mode";
+import type { Phase } from "#app/phase";
 import { allMoves } from "#data/data-lists";
 import { getCriticalCaptureChance, getPokeballCatchMultiplier } from "#data/pokeball";
 import { getStatusEffectCatchRateMultiplier } from "#data/status-effect";
 import { AbilityId } from "#enums/ability-id";
 import { BattleStyle } from "#enums/battle-style";
+import { BattlerIndex } from "#enums/battler-index";
 import { BattleType } from "#enums/battle-type";
 import { BiomeId } from "#enums/biome-id";
 import { Button } from "#enums/buttons";
@@ -48,6 +51,7 @@ import type { EnemyPokemon, Pokemon } from "#field/pokemon";
 import { HealShopCostModifier } from "#modifiers/modifier";
 import {
   FusePokemonModifierType,
+  getPartyLuckValue,
   getPlayerShopModifierTypeOptionsForWave,
   type ModifierType,
   type ModifierTypeOption,
@@ -57,14 +61,18 @@ import {
   TmModifierType,
 } from "#modifiers/modifier-type";
 import type { Move } from "#moves/move";
+import { getMoveTargets } from "#moves/move-utils";
+import type { AttemptCapturePhase } from "#phases/attempt-capture-phase";
 import type { CommandPhase } from "#phases/command-phase";
 import type { LearnMovePhase } from "#phases/learn-move-phase";
+import type { PokemonPhase } from "#phases/pokemon-phase";
 import type { SelectModifierPhase } from "#phases/select-modifier-phase";
 import { SelectStarterPhase } from "#phases/select-starter-phase";
 import { GameManager } from "#test/framework/game-manager";
 import { PromptHandler } from "#test/helpers/prompt-handler";
 import { generateStarters } from "#test/utils/game-manager-utils";
 import type { StarterMoveset } from "#types/save-data";
+import { PartyOption } from "#ui/party-ui-handler";
 import { getStarterMoves } from "#ui/utils/starter-select-ui-utils";
 import { NumberHolder, randomString } from "#utils/common";
 import net from "node:net";
@@ -75,7 +83,11 @@ const PORT = Number(process.env.RL_PORT ?? 0);
 /** Command actions: 0-3 moves, 4-9 switch to party slot, 10-14 throw ball type (Poke, Great, Ultra, Rogue, Master). */
 const NUM_COMMAND_ACTIONS = 15;
 const NUM_BALL_TYPES = 5;
+/** Release decision: 0-5 release that party slot to keep the catch, 6 lets the catch go. */
+const RELEASE_DECLINE = 6;
 const MAX_PHASES_PER_STEP = 5000;
+/** Display-only phases that crash against the mocked UI; skipping them has no gameplay effect. */
+const SKIPPED_PHASES = new Set(["ScanIvsPhase"]);
 /**
  * Ends the episode if the agent makes this many decisions without the wave advancing.
  * Some decisions can loop by design (declining a TM returns to the reward screen).
@@ -103,6 +115,8 @@ interface ResetOpts {
   /** IV applied to every stat of every starter; default 31. */
   ivs?: number;
   nature?: Nature;
+  /** Indices of starters that start with Pokerus (1.5x EXP, spreads to party neighbours); default [0]. */
+  pokerus?: number[];
 }
 
 interface RewardOption {
@@ -117,7 +131,10 @@ type Decision =
   | { kind: "command"; phase: CommandPhase }
   | { kind: "reward"; phase: SelectModifierPhase; options: RewardOption[] }
   | { kind: "reward_target"; phase: SelectModifierPhase; option: RewardOption }
-  | { kind: "learn_move"; phase: LearnMovePhase };
+  | { kind: "learn_move"; phase: LearnMovePhase }
+  // Mid-phase decisions: the phase is still running while it waits on these.
+  | { kind: "faint_switch"; phase: Phase }
+  | { kind: "release"; phase: AttemptCapturePhase };
 
 class Sim {
   private game!: GameManager;
@@ -132,6 +149,8 @@ class Sim {
   private approvedLearnMove?: LearnMovePhase;
   private decisionWave = 0;
   private decisionsThisWave = 0;
+  /** The scene's MockClock, patched by installManualClock. */
+  private clock: any;
 
   constructor(private readonly phaserGame: Phaser.Game) {}
 
@@ -157,6 +176,8 @@ class Sim {
     this.game = new GameManager(this.phaserGame);
     BattleScene.prototype.randBattleSeedInt = realRandBattleSeedInt;
     this.installCaptureCounter();
+    this.installManualClock();
+    this.manualClock = false; // the test framework's helpers below need the wall-clock interval
     this.game.settings.battleStyle(BattleStyle.SET);
     this.maxWave = opts.maxWave ?? Number.POSITIVE_INFINITY;
     this.autoInputs = {};
@@ -175,8 +196,10 @@ class Sim {
       this.scene.gameMode = getGameMode(mode);
       const starters = generateStarters(this.scene, species);
       // The test helper rolls these randomly before the run seed exists; pin them for reproducibility.
-      for (const starter of starters) {
+      const pokerus = opts.pokerus ?? [0];
+      for (const [i, starter] of starters.entries()) {
         Object.assign(starter, {
+          pokerus: pokerus.includes(i),
           ivs: new Array(6).fill(opts.ivs ?? 31),
           nature: opts.nature ?? Nature.HARDY,
           abilityIndex: 0,
@@ -197,8 +220,40 @@ class Sim {
     });
     await this.game.phaseInterceptor.to("EncounterPhase");
 
+    this.manualClock = true;
     this.startWatchdog();
     return this.advance();
+  }
+
+  /**
+   * The test harness's MockClock advances on a real 1ms setInterval, so game timers (delayedCall,
+   * text delays) fire by wall time and their order relative to other game logic varies under CPU
+   * load, making runs nondeterministic. While `manualClock` is set, ignore the interval and advance
+   * the clock one fixed step per poll in `waitUntil` instead.
+   */
+  private installManualClock() {
+    const clock = this.scene.time as any;
+    if (!clock.rlTick) {
+      // The scene, and its clock, persist across resets: patch once.
+      const preUpdate = clock.preUpdate.bind(clock);
+      const update = clock.update.bind(clock);
+      const tick = () => {
+        preUpdate();
+        update(clock.systems.game.loop.time, 1);
+      };
+      clock.preUpdate = () => {};
+      clock.update = () => {
+        if (!clock.rlManual) {
+          tick();
+        }
+      };
+      clock.rlTick = tick;
+    }
+    this.clock = clock;
+  }
+
+  private set manualClock(on: boolean) {
+    this.clock.rlManual = on;
   }
 
   /**
@@ -308,7 +363,45 @@ class Sim {
         this.approvedLearnMove = decision.phase;
         return this.advance();
       }
+
+      case "faint_switch": {
+        const handler = this.scene.ui.getHandler() as any;
+        handler.setCursor(action);
+        handler.processInput(Button.ACTION); // select slot
+        handler.processInput(Button.ACTION); // "Send out"
+        return this.resume(decision.phase, UiMode.PARTY);
+      }
+
+      case "release": {
+        const ui = this.scene.ui;
+        // Party-full menu: [Summary, Pokedex, Yes (keep it, release someone), No (let it go)].
+        const options = (ui.getHandler() as any).config.options;
+        if (action === RELEASE_DECLINE) {
+          options[3].handler();
+          return this.resume(decision.phase, UiMode.OPTION_SELECT);
+        }
+        options[2].handler();
+        await this.waitUntil(
+          () => ui.mode === UiMode.PARTY && !!(ui.getHandler() as any).selectCallback,
+          "release menu",
+        );
+        // Do what PartyUiHandler.doRelease does, minus its message and sprite refresh.
+        const partyHandler = ui.getHandler() as any;
+        this.scene.removePartyMemberModifiers(action);
+        this.scene.getPlayerParty().splice(action, 1)[0].destroy();
+        const callback = partyHandler.selectCallback;
+        partyHandler.selectCallback = null;
+        callback(action, PartyOption.RELEASE); // adds the caught Pokemon at this slot
+        return this.resume(decision.phase, UiMode.PARTY);
+      }
     }
+  }
+
+  /** Continue a phase that paused for a mid-phase decision, once its UI has moved on from `fromMode`. */
+  private async resume(phase: Phase, fromMode: UiMode) {
+    await this.waitUntil(() => this.scene.ui.mode !== fromMode || this.interceptorState !== "running", "UI to move on");
+    const paused = await this.waitForPhase(phase);
+    return paused ? this.decide(paused) : this.advance();
   }
 
   private applyReward(phase: SelectModifierPhase, option: RewardOption, slot?: number) {
@@ -348,11 +441,23 @@ class Sim {
       if (this.scene.currentBattle && this.scene.currentBattle.waveIndex > this.maxWave) {
         return this.result(true, "max_wave");
       }
+      if (SKIPPED_PHASES.has(name)) {
+        pm.shiftPhase();
+        continue;
+      }
+      if (name === "SelectTargetPhase") {
+        this.autoTarget(phase as PokemonPhase);
+        pm.shiftPhase();
+        continue;
+      }
       if (name === "LearnMovePhase" && phase !== this.approvedLearnMove && this.needsLearnDecision(phase as LearnMovePhase)) {
         return this.decide({ kind: "learn_move", phase: phase as LearnMovePhase });
       }
 
-      await this.runPhase(phase);
+      const paused = await this.runPhase(phase);
+      if (paused) {
+        return this.decide(paused);
+      }
 
       if (this.interceptorState !== "interrupted" || pm.getCurrentPhase() !== phase) {
         continue;
@@ -366,6 +471,25 @@ class Sim {
       }
     }
     throw new Error(`advance(): exceeded ${MAX_PHASES_PER_STEP} phases without a decision`);
+  }
+
+  /**
+   * Resolve a SelectTargetPhase without its UI, which otherwise needs timing-dependent input.
+   * Multi-target moves already have their targets; ambiguous single-target moves (doubles)
+   * get the first enemy. TODO: make the target an agent decision for double battles.
+   */
+  private autoTarget(phase: PokemonPhase) {
+    const command = this.scene.currentBattle.turnCommands[phase.fieldIndex];
+    if (!command?.move || (command.move.targets?.length ?? 0) > 0) {
+      return;
+    }
+    const user = this.scene.getPlayerField()[phase.fieldIndex];
+    const { targets } = getMoveTargets(user, command.move.move);
+    const target = targets.find(t => t >= BattlerIndex.ENEMY) ?? targets[0];
+    if (target !== undefined) {
+      command.targets = [target];
+    }
+    this.count("auto_target");
   }
 
   private decide(decision: Decision) {
@@ -382,13 +506,39 @@ class Sim {
     return this.result(false);
   }
 
-  /** Start a phase and wait until it ends or interrupts for UI input (no 50ms polling). */
-  private async runPhase(phase: ReturnType<BattleScene["phaseManager"]["getCurrentPhase"]>) {
+  /**
+   * Start a phase and wait until it ends, interrupts for UI input, or pauses on a mid-phase
+   * agent decision (returned). Polls every tick rather than the test framework's 50ms.
+   */
+  private async runPhase(phase: Phase): Promise<Decision | undefined> {
     const interceptor = this.game.phaseInterceptor;
     interceptor["target"] = phase.phaseName;
     interceptor["state"] = "running";
     phase.start();
-    await this.waitUntil(() => this.interceptorState !== "running", `running ${phase.phaseName}`);
+    return this.waitForPhase(phase);
+  }
+
+  private async waitForPhase(phase: Phase): Promise<Decision | undefined> {
+    let paused: Decision | undefined;
+    await this.waitUntil(() => {
+      paused = this.interceptorState === "running" ? this.midPhaseDecision(phase) : undefined;
+      return paused !== undefined || this.interceptorState !== "running";
+    }, `running ${phase.phaseName}`);
+    return paused;
+  }
+
+  private midPhaseDecision(phase: Phase): Decision | undefined {
+    const ui = this.scene.ui;
+    if (!(ui.getHandler() as any)?.active) {
+      return undefined;
+    }
+    if (phase.is("SwitchPhase") && ui.mode === UiMode.PARTY) {
+      return { kind: "faint_switch", phase };
+    }
+    if (phase.is("AttemptCapturePhase") && ui.mode === UiMode.OPTION_SELECT) {
+      return { kind: "release", phase: phase as AttemptCapturePhase };
+    }
+    return undefined;
   }
 
   private async waitUntil(cond: () => boolean, what: string) {
@@ -397,6 +547,9 @@ class Sim {
       if (Date.now() - start > STALL_TIMEOUT_MS) {
         const phase = this.scene.phaseManager.getCurrentPhase()?.phaseName;
         throw new Error(`Stalled ${STALL_TIMEOUT_MS}ms while ${what} (phase=${phase}, ui=${UiMode[this.scene.ui.mode]})`);
+      }
+      if (this.clock.rlManual) {
+        this.clock.rlTick();
       }
       await new Promise(resolve => setImmediate(resolve));
     }
@@ -414,6 +567,18 @@ class Sim {
         return this.targetMask(decision.option.type as PokemonModifierType);
       case "learn_move":
         return [true, true, true, true, true];
+      case "faint_switch": {
+        const party = this.scene.getPlayerParty();
+        const battlers = this.scene.currentBattle.getBattlerCount();
+        return [0, 1, 2, 3, 4, 5].map(
+          i => i >= battlers && i < party.length && party[i].isAllowedInBattle() && !party[i].isOnField(),
+        );
+      }
+      case "release": {
+        // Any party slot can be released; the battle ends after a catch.
+        const size = this.scene.getPlayerParty().length;
+        return [...[0, 1, 2, 3, 4, 5].map(i => i < size), true];
+      }
     }
   }
 
@@ -454,8 +619,6 @@ class Sim {
       || battle.isBattleMysteryEncounter()
       // Conservative: End-biome catch rules depend on mode and boss status; just disallow there.
       || arena.biomeId === BiomeId.END
-      // A full party opens a release menu after a catch, which isn't modelled yet.
-      || this.scene.getPlayerParty().length >= PLAYER_PARTY_MAX_SIZE
     ) {
       return undefined;
     }
@@ -593,23 +756,19 @@ class Sim {
     }
     this.stallTicks = 0;
 
+    // Agent decisions; never auto-answer.
+    const agentScreen =
+      ui.mode === UiMode.COMMAND
+      || ui.mode === UiMode.FIGHT
+      || ui.mode === UiMode.MODIFIER_SELECT
+      || (ui.mode === UiMode.PARTY && (phaseName === "SwitchPhase" || phaseName === "AttemptCapturePhase"))
+      || (ui.mode === UiMode.OPTION_SELECT && phaseName === "AttemptCapturePhase");
+    if (agentScreen) {
+      return;
+    }
+
     switch (ui.mode) {
-      case UiMode.COMMAND:
-      case UiMode.FIGHT:
-      case UiMode.MODIFIER_SELECT:
-        // Agent decisions; never auto-answer.
-        return;
       case UiMode.PARTY: {
-        if (phaseName === "SwitchPhase") {
-          const slot = this.firstBenchSlot();
-          if (slot >= 0) {
-            handler.setCursor(slot);
-            handler.processInput(Button.ACTION); // select slot
-            handler.processInput(Button.ACTION); // "Send out"
-            this.count("faint_switch");
-            return;
-          }
-        }
         handler.processInput(Button.CANCEL);
         this.count(`party_cancel:${phaseName}`);
         return;
@@ -629,12 +788,6 @@ class Sim {
           this.count(`${UiMode[ui.mode]}:${phaseName}`);
         }
     }
-  }
-
-  private firstBenchSlot(): number {
-    const party = this.scene.getPlayerParty();
-    const battlers = this.scene.currentBattle.getBattlerCount();
-    return party.findIndex((p, i) => i >= battlers && p.isAllowedInBattle() && !p.isOnField());
   }
 
   private count(key: string) {
@@ -663,6 +816,9 @@ class Sim {
       species: p.species.speciesId,
       bst: p.species.baseTotal,
       catchRate: p.species.catchRate,
+      shiny: p.isShiny(),
+      luck: p.getLuck(),
+      pokerus: p.pokerus,
       level: p.level,
       hp: p.hp,
       maxHp: p.getMaxHp(),
@@ -703,7 +859,7 @@ class Sim {
     const scene = this.scene;
     const battle = scene.currentBattle;
     const d = done ? undefined : this.decision;
-    const isCommand = d?.kind === "command";
+    const withDamage = d?.kind === "command" || d?.kind === "faint_switch";
     const obs: Record<string, unknown> = {
       kind: d?.kind ?? "done",
       legal: d ? this.legalMask(d) : [],
@@ -715,7 +871,8 @@ class Sim {
       money: scene.money,
       biome: scene.arena?.biomeId,
       balls: [0, 1, 2, 3, 4].map(b => scene.pokeballCounts[b as PokeballType] ?? 0),
-      party: scene.getPlayerParty().map(p => this.encodePokemon(p, isCommand)),
+      luck: getPartyLuckValue(scene.getPlayerParty()),
+      party: scene.getPlayerParty().map(p => this.encodePokemon(p, withDamage)),
       enemies: scene.getEnemyField().map(p => this.encodePokemon(p, false)),
     };
     if (d?.kind === "command") {
@@ -736,6 +893,8 @@ class Sim {
       obs.item = { id: itemId(d.option.type!), cost: d.option.cost };
     } else if (d?.kind === "learn_move") {
       obs.learn = { slot: d.phase["partyMemberIndex"], move: this.encodeMove(d.phase["moveId"]) };
+    } else if (d?.kind === "release") {
+      obs.caught = this.encodePokemon(d.phase.getPokemon(), false);
     }
     return {
       obs,
