@@ -5,7 +5,8 @@ Strategy, from the death report and player experience:
 - Fainted members are the main cause of runs ending: revives are top priority, and money (only
   from items in endless, which has no trainers) is saved for them.
 - Shiny Pokemon raise party luck, which upgrades reward tiers: always catch them.
-- Double battles give more EXP per wave, but this agent plays them badly, so it avoids lures.
+- Double battles give more EXP per wave but block catching; whether to seek them with lures is
+  configurable (`lures="seek"` or `"avoid"`). In doubles, aim at the enemy we can KO or hurt most.
 - Prepare for boss waves (every 10th) with heals and stat boosters on the wave before.
 
 Battle: take a likely KO, otherwise the move with the highest expected damage; switch out only
@@ -21,6 +22,7 @@ BALL_ACTION = 10  # command actions 10-14 throw Poke/Great/Ultra/Rogue/Master Ba
 MASTER_BALL = 4
 MASTER_BALL_BST = 580  # save the Master Ball for legendary-tier catches (or shinies)
 RELEASE_DECLINE = 6
+ENEMY_TARGET = 2  # target decision: battler indices 0-1 are our side, 2-3 the enemies
 
 HEALS = {  # fraction of max HP restored (approximate; Full Restore also cures status)
     "POTION": 0.2, "SUPER_POTION": 0.4, "HYPER_POTION": 0.6, "MAX_POTION": 1.0, "FULL_RESTORE": 1.0,
@@ -54,12 +56,15 @@ ITEM_VALUE = {
     # Money: endless has no trainers, so items are the only income, and it buys revives.
     "AMULET_COIN": 0.65, "NUGGET": 0.45, "BIG_NUGGET": 0.6, "RELIC_GOLD": 0.7, "GOLDEN_PUNCH": 0.3,
     "TEMP_STAT_STAGE_BOOSTER": 0.25, "DIRE_HIT": 0.2, "MEMORY_MUSHROOM": 0.0,
-    # Balls build the team. Lures add double battles, which give more EXP per wave but this agent
-    # plays them badly (scripted targeting, no catching): valuing lures at +0.35..0.45 cut the mean
-    # death wave from 20.6 to 17.2 over 96 seeds. Revisit once targets are agent decisions.
+    # Balls build the team. Lures: see LURE_VALUES.
     "POKEBALL": 0.15, "GREAT_BALL": 0.25, "ULTRA_BALL": 0.35, "ROGUE_BALL": 0.4, "MASTER_BALL": 0.7,
-    "LURE": -0.1, "SUPER_LURE": -0.1, "MAX_LURE": -0.1, "VOUCHER": 0.0, "VOUCHER_PLUS": 0.0,
+    "VOUCHER": 0.0, "VOUCHER_PLUS": 0.0,
     "VOUCHER_PREMIUM": 0.0, "MAP": 0.05,
+}
+# Lures make double battles more common: more EXP per wave, but no catching while two enemies are up.
+LURE_VALUES = {
+    "avoid": {"LURE": -0.1, "SUPER_LURE": -0.1, "MAX_LURE": -0.1},
+    "seek": {"LURE": 0.35, "SUPER_LURE": 0.4, "MAX_LURE": 0.45},
 }
 DEFAULT_ITEM_VALUE = 0.3
 SKIP_THRESHOLD = 0.05
@@ -107,7 +112,8 @@ def member_value(p: dict) -> float:
 
 
 class HeuristicAgent:
-    def __init__(self) -> None:
+    def __init__(self, lures: str = "avoid") -> None:
+        self.item_value = {**ITEM_VALUE, **LURE_VALUES[lures]}
         self.reset()
 
     def reset(self) -> None:
@@ -222,6 +228,23 @@ class HeuristicAgent:
             return best_move
         return legal.index(True)
 
+    def _target(self, obs: dict) -> int:
+        """Doubles: finish off an enemy we can KO (the strongest such), else hit the one we hurt most."""
+        legal = [t for t, ok in enumerate(obs["legal"]) if ok]
+        enemy_targets = [t for t in legal if t >= ENEMY_TARGET]
+        if not enemy_targets:
+            return legal[0]  # only allies are valid for this move
+        actor = obs["party"][obs["actor"]]
+        slot = obs["move"]["slot"]
+        dmg = actor["moves"][slot]["dmg"] if slot is not None and slot < len(actor["moves"]) else []
+
+        def score(t: int) -> tuple:
+            i = t - ENEMY_TARGET
+            d = dmg[i] if i < len(dmg) and dmg[i] is not None else 0.0
+            return (d >= 1.0, obs["enemies"][i]["bst"] if d >= 1.0 else d)
+
+        return max(enemy_targets, key=score)
+
     def _faint_switch(self, obs: dict) -> int:
         party = obs["party"]
         legal = [i for i, ok in enumerate(obs["legal"]) if ok]
@@ -273,9 +296,9 @@ class HeuristicAgent:
                 tm = opt["tmMove"]
                 useful = (obs["wave"], tm["id"]) not in self.declined_tms and any(
                     learn_gain(tm, p) > 0 for p in party)
-                score = ITEM_VALUE.get(item, DEFAULT_ITEM_VALUE) if useful else 0.0
+                score = self.item_value.get(item, DEFAULT_ITEM_VALUE) if useful else 0.0
             else:
-                score = ITEM_VALUE.get(item, DEFAULT_ITEM_VALUE)
+                score = self.item_value.get(item, DEFAULT_ITEM_VALUE)
             if opt["kind"] == "shop":
                 # Money is scarce: buy only revives for fainted members, or urgent heals.
                 if item in REVIVES and fainted:

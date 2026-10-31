@@ -16,4 +16,8 @@ class RandomAgent:
         return self.rng.choice([i for i, ok in enumerate(obs["legal"]) if ok])
 
 
-AGENTS = {"random": RandomAgent, "heuristic": HeuristicAgent}
+AGENTS = {
+    "random": RandomAgent,
+    "heuristic": HeuristicAgent,
+    "heuristic-lures": lambda: HeuristicAgent(lures="seek"),
+}
