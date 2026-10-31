@@ -994,9 +994,23 @@ function serve(sim: Sim): Promise<void> {
   });
 }
 
+/**
+ * The game logs constantly (e.g. every move's targets). The test harness's MockConsole runs
+ * util.inspect on each argument, and Vitest buffers a test's console output until it finishes,
+ * which for this never-ending "test" means unbounded memory growth. Drop all but errors.
+ */
+function silenceConsole(): void {
+  const quiet = () => {};
+  for (const method of ["log", "info", "debug", "warn", "trace", "table", "group", "groupCollapsed", "groupEnd"]) {
+    (console as any)[method] = quiet;
+  }
+  console.error = (...data: unknown[]) => log(`console.error: ${data.map(String).join(" ")}`);
+}
+
 it.skipIf(!process.env.RL_PORT)(
   "RL simulator server",
   async () => {
+    silenceConsole();
     const phaserGame = new Phaser.Game({ type: Phaser.HEADLESS });
     await serve(new Sim(phaserGame));
   },
