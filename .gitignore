@@ -1,0 +1,13 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Training outputs
+runs/
+checkpoints/
+logs/
+*.log
+
+# Local Claude Code settings
+.claude/settings.local.json
