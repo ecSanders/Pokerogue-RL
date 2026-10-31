@@ -11,7 +11,7 @@
  *   <- {"ok":true,"obs":{...},"done":false,"info":{...}}  |  {"ok":false,"error":"..."}
  *
  * Every observation has a decision `kind` and a `legal` mask over that kind's actions:
- *   command        0-3 = use move slot, 4+k = switch to party slot k
+ *   command        0-3 = use move slot, 4+k = switch to party slot k, 10+b = throw ball type b
  *   reward         index into obs.options (rewards, shop items, reroll, skip)
  *   reward_target  party slot to receive the chosen item
  *   learn_move     0-3 = replace that move slot with obs.learn.move, 4 = don't learn
@@ -26,17 +26,24 @@
  */
 
 import { BattleScene } from "#app/battle-scene";
+import { PLAYER_PARTY_MAX_SIZE } from "#app/constants";
 import { getGameMode } from "#app/game-mode";
 import { allMoves } from "#data/data-lists";
+import { getCriticalCaptureChance, getPokeballCatchMultiplier } from "#data/pokeball";
+import { getStatusEffectCatchRateMultiplier } from "#data/status-effect";
+import { AbilityId } from "#enums/ability-id";
 import { BattleStyle } from "#enums/battle-style";
+import { BattleType } from "#enums/battle-type";
+import { BiomeId } from "#enums/biome-id";
 import { Button } from "#enums/buttons";
 import { Command } from "#enums/command";
 import { GameModes } from "#enums/game-modes";
 import { MoveId } from "#enums/move-id";
 import { Nature } from "#enums/nature";
+import { PokeballType } from "#enums/pokeball";
 import { SpeciesId } from "#enums/species-id";
 import { UiMode } from "#enums/ui-mode";
-import type { Pokemon } from "#field/pokemon";
+import type { EnemyPokemon, Pokemon } from "#field/pokemon";
 import { HealShopCostModifier } from "#modifiers/modifier";
 import {
   FusePokemonModifierType,
@@ -64,7 +71,9 @@ import Phaser from "phaser";
 import { it, vi } from "vitest";
 
 const PORT = Number(process.env.RL_PORT ?? 0);
-const NUM_COMMAND_ACTIONS = 10;
+/** Command actions: 0-3 moves, 4-9 switch to party slot, 10-14 throw ball type (Poke, Great, Ultra, Rogue, Master). */
+const NUM_COMMAND_ACTIONS = 15;
+const NUM_BALL_TYPES = 5;
 const MAX_PHASES_PER_STEP = 5000;
 /**
  * Ends the episode if the agent makes this many decisions without the wave advancing.
@@ -146,6 +155,7 @@ class Sim {
 
     this.game = new GameManager(this.phaserGame);
     BattleScene.prototype.randBattleSeedInt = realRandBattleSeedInt;
+    this.installCaptureCounter();
     this.game.settings.battleStyle(BattleStyle.SET);
     this.maxWave = opts.maxWave ?? Number.POSITIVE_INFINITY;
     this.autoInputs = {};
@@ -190,6 +200,47 @@ class Sim {
     return this.advance();
   }
 
+  /**
+   * The test harness mocks tween counters to fire only `onComplete`. Ball shake checks run in
+   * `onRepeat`, so every throw would succeed. Run the capture shake counter faithfully instead.
+   * Other counters (battle animations, particles) are purely visual and keep the cheap mock.
+   */
+  private installCaptureCounter() {
+    const tweens = this.scene.tweens as any;
+    if (tweens.rlCaptureCounter) {
+      return; // the scene, and its tween mock, persist across resets
+    }
+    const mockAddCounter = tweens.addCounter;
+    tweens.addCounter = (config: any) => {
+      const isShake =
+        this.scene.phaseManager.getCurrentPhase()?.is("AttemptCapturePhase")
+        && config.yoyo
+        && config.onRepeat
+        && config.repeat > 0;
+      if (!isShake) {
+        return mockAddCounter(config);
+      }
+      let stopped = false;
+      const counter = {
+        stop: () => {
+          stopped = true;
+        },
+        getValue: () => 0,
+      };
+      // Callbacks reference the counter through the caller's variable, so run after returning it.
+      queueMicrotask(() => {
+        for (let i = 0; i < config.repeat && !stopped; i++) {
+          config.onRepeat(counter);
+        }
+        if (!stopped) {
+          config.onComplete?.(counter);
+        }
+      });
+      return counter;
+    };
+    tweens.rlCaptureCounter = true;
+  }
+
   async step(action: number) {
     const decision = this.decision;
     if (!decision) {
@@ -218,7 +269,9 @@ class Sim {
         const ok =
           action < 4
             ? phase.handleCommand(Command.FIGHT, action)
-            : phase.handleCommand(Command.POKEMON, action - 4, false);
+            : action < 10
+              ? phase.handleCommand(Command.POKEMON, action - 4, false)
+              : phase.handleCommand(Command.BALL, action - 10);
         if (!ok) {
           throw new Error(`CommandPhase rejected legal action ${action}`);
         }
@@ -382,7 +435,64 @@ class Sim {
         mask[4 + slot] = party[slot].isAllowedInBattle() && !party[slot].isOnField();
       }
     }
+    const target = this.ballTarget();
+    for (let ball = 0; ball < NUM_BALL_TYPES; ball++) {
+      mask[10 + ball] = target !== undefined && this.canThrowBall(target, ball);
+    }
     return mask;
+  }
+
+  /**
+   * The wild Pokemon a ball would target, if throwing is allowed at all. Mirrors
+   * CommandPhase.checkCanUseBall/handleBallCommand, whose failure paths leave UI text behind.
+   */
+  private ballTarget(): EnemyPokemon | undefined {
+    const { currentBattle: battle, arena } = this.scene;
+    if (
+      battle.battleType !== BattleType.WILD
+      || battle.isBattleMysteryEncounter()
+      // Conservative: End-biome catch rules depend on mode and boss status; just disallow there.
+      || arena.biomeId === BiomeId.END
+      // A full party opens a release menu after a catch, which isn't modelled yet.
+      || this.scene.getPlayerParty().length >= PLAYER_PARTY_MAX_SIZE
+    ) {
+      return undefined;
+    }
+    const targets = this.scene.getEnemyField().filter(p => p.isActive(true));
+    return targets.length === 1 ? (targets[0] as EnemyPokemon) : undefined;
+  }
+
+  private canThrowBall(target: EnemyPokemon, ball: PokeballType): boolean {
+    if ((this.scene.pokeballCounts[ball] ?? 0) <= 0) {
+      return false;
+    }
+    // Bosses with a broken shield can only be caught with a Master Ball.
+    const shielded =
+      target.isBoss() && target.bossSegmentIndex >= 1 && !target.hasAbility(AbilityId.WONDER_GUARD, false, true);
+    return !shielded || ball === PokeballType.MASTER_BALL;
+  }
+
+  /** Probability a ball catches the target, per AttemptCapturePhase (ignoring the shiny bonus). */
+  private catchChance(target: EnemyPokemon, ball: PokeballType): number {
+    if (!this.canThrowBall(target, ball)) {
+      return 0;
+    }
+    const multiplier = getPokeballCatchMultiplier(ball);
+    if (multiplier === -1) {
+      return 1;
+    }
+    const maxHp3 = 3 * target.getMaxHp();
+    const statusMultiplier = target.status ? getStatusEffectCatchRateMultiplier(target.status.effect) : 1;
+    const rate = Math.round(
+      (((maxHp3 - 2 * target.hp) * target.species.catchRate * multiplier) / maxHp3) * statusMultiplier,
+    );
+    if (rate >= 255) {
+      return 1;
+    }
+    const shake = Math.round(65536 / Math.pow(255 / rate, 0.1875)) / 65536;
+    const critical = getCriticalCaptureChance(rate) / 256;
+    // Critical captures need one shake check, normal ones three.
+    return critical * shake + (1 - critical) * shake ** 3;
   }
 
   private rewardOptions(phase: SelectModifierPhase): RewardOption[] {
@@ -550,6 +660,8 @@ class Sim {
     const enemies = withDamage ? this.scene.getEnemyField() : [];
     return {
       species: p.species.speciesId,
+      bst: p.species.baseTotal,
+      catchRate: p.species.catchRate,
       level: p.level,
       hp: p.hp,
       maxHp: p.getMaxHp(),
@@ -598,12 +710,15 @@ class Sim {
       turn: battle?.turn ?? 0,
       double: battle?.double ?? false,
       money: scene.money,
-      biome: scene.arena?.biomeType,
+      biome: scene.arena?.biomeId,
+      balls: [0, 1, 2, 3, 4].map(b => scene.pokeballCounts[b as PokeballType] ?? 0),
       party: scene.getPlayerParty().map(p => this.encodePokemon(p, isCommand)),
       enemies: scene.getEnemyField().map(p => this.encodePokemon(p, false)),
     };
     if (d?.kind === "command") {
       obs.actor = d.phase.getFieldIndex();
+      const target = this.ballTarget();
+      obs.catchChance = [0, 1, 2, 3, 4].map(b => (target ? this.catchChance(target, b) : 0));
     } else if (d?.kind === "reward") {
       obs.options = d.options.map(o => ({
         kind: o.kind,

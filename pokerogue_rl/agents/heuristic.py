@@ -1,7 +1,8 @@
 """Scripted baseline agent.
 
-Battle: take a likely KO, otherwise the move with the highest expected damage; switch out only
-when badly outmatched and a healthy teammate does much better. Rewards: score items against the
+Battle: catch wild Pokemon that would strengthen the team (weakening them first if needed); else
+take a likely KO, otherwise the move with the highest expected damage; switch out only when badly
+outmatched and a healthy teammate does much better. Rewards: score items against the
 team's current state. Learn move: replace the weakest move if the new one is stronger.
 """
 
@@ -9,6 +10,9 @@ from __future__ import annotations
 
 STATUS_CATEGORY = 2
 STATUS_MOVE_VALUE = 10.0
+BALL_ACTION = 10  # command actions 10-14 throw Poke/Great/Ultra/Rogue/Master Ball
+MASTER_BALL = 4
+MASTER_BALL_BST = 580  # save the Master Ball for legendary-tier catches
 
 HEALS = {  # fraction of max HP restored (approximate; Full Restore also cures status)
     "POTION": 0.2, "SUPER_POTION": 0.4, "HYPER_POTION": 0.6, "MAX_POTION": 1.0, "FULL_RESTORE": 1.0,
@@ -34,8 +38,8 @@ ITEM_VALUE = {
     # Economy and one-wave buffs
     "AMULET_COIN": 0.5, "NUGGET": 0.3, "BIG_NUGGET": 0.45, "RELIC_GOLD": 0.55, "GOLDEN_PUNCH": 0.3,
     "TEMP_STAT_STAGE_BOOSTER": 0.25, "DIRE_HIT": 0.2, "MEMORY_MUSHROOM": 0.0,
-    # Can't catch yet, and lures add double battles: worthless or harmful for now.
-    "POKEBALL": 0.0, "GREAT_BALL": 0.0, "ULTRA_BALL": 0.0, "ROGUE_BALL": 0.0, "MASTER_BALL": 0.0,
+    # Balls build the team; lures add double battles, where catching isn't possible.
+    "POKEBALL": 0.15, "GREAT_BALL": 0.25, "ULTRA_BALL": 0.35, "ROGUE_BALL": 0.4, "MASTER_BALL": 0.7,
     "LURE": -0.1, "SUPER_LURE": -0.1, "MAX_LURE": -0.1, "VOUCHER": 0.0, "VOUCHER_PLUS": 0.0,
     "VOUCHER_PREMIUM": 0.0, "MAP": 0.05,
 }
@@ -94,10 +98,37 @@ class HeuristicAgent:
 
     # Battle
 
+    def _catch(self, obs: dict) -> int | str | None:
+        """A ball action, "weaken" to lower the target's HP first, or None to battle normally."""
+        legal, party, chance = obs["legal"], obs["party"], obs["catchChance"]
+        balls = [b for b in range(5) if legal[BALL_ACTION + b]]
+        if not balls:
+            return None
+        enemy = next(e for e in obs["enemies"] if e["hp"] > 0)
+        if len(party) >= 4 and enemy["bst"] < min(p["bst"] for p in party):
+            return None
+        if MASTER_BALL in balls and enemy["bst"] >= MASTER_BALL_BST:
+            return BALL_ACTION + MASTER_BALL
+        normal = sorted(b for b in balls if b != MASTER_BALL)
+        if not normal:
+            return None
+        for b in normal:  # cheapest ball that's likely to work
+            if chance[b] >= 0.5:
+                return BALL_ACTION + b
+        if hp_ratio(enemy) > 0.35:
+            return "weaken"
+        best = max(normal, key=lambda b: chance[b])
+        return BALL_ACTION + best if chance[best] >= 0.15 else None
+
     def _command(self, obs: dict) -> int:
         legal = obs["legal"]
         party = obs["party"]
         actor = party[obs["actor"]]
+
+        catch = self._catch(obs)
+        if isinstance(catch, int):
+            return catch
+        weaken = catch == "weaken"
 
         best_move, best_score = -1, -1.0
         for i, m in enumerate(actor["moves"]):
@@ -106,6 +137,8 @@ class HeuristicAgent:
             dmg = max((d for d in m.get("dmg", []) if d is not None), default=0.0)
             if m["category"] == STATUS_CATEGORY or dmg <= 0:
                 score = 0.01
+            elif weaken:
+                score = dmg if dmg < 0.85 else -0.5  # chip damage without knocking it out
             elif dmg >= 1.0:
                 score = 1.0 + accuracy(m) + 0.1 * max(m["priority"], 0)  # likely KO
             else:
