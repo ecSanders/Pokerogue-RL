@@ -22,6 +22,26 @@ Check it works:
 .venv/bin/python scripts/check_determinism.py  # same seed + actions => same game
 ```
 
+Evaluate an agent over seeded endless runs with parallel simulators:
+
+```bash
+.venv/bin/python scripts/eval_agent.py --agent heuristic --episodes 40 --workers 8 --max-wave 200
+```
+
+## Decisions
+
+Each observation has a `kind` and a `legal` mask over that kind's actions:
+
+| kind | actions |
+|---|---|
+| `command` | 0–3 use move slot, 4+k switch to party slot k |
+| `reward` | index into `obs.options`: free rewards, shop items, reroll, skip |
+| `reward_target` | party slot that receives the chosen item |
+| `learn_move` | 0–3 replace that slot with `obs.learn.move`, 4 don't learn |
+
+Faint switches, biome choice, double-battle targeting and other prompts are still scripted
+defaults (counted in `info.autoInputs`). Mystery encounters are disabled and catching isn't possible.
+
 ## Layout
 
 | Path | Contents |
