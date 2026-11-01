@@ -1,38 +1,90 @@
-"""Client for the headless PokeRogue simulator (pokerogue/test/rl/sim-server.test.ts).
+"""Client for the headless PokeRogue simulator (sim/sim-server.ts).
 
 The simulator speaks newline-delimited JSON over localhost TCP. `SimClient` connects to a
-running server; `SimClient.launch()` starts one as a subprocess first.
+running server. `launch_sims(n)` starts one Vitest process hosting n simulators (~1.3GB shared plus
+~0.7GB each, instead of ~2.1GB each as separate processes); `SimClient.launch()` starts one.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import random
 import socket
 import subprocess
 import time
 from pathlib import Path
 
-from pokerogue_rl.install_sim import install_sim
+from pokerogue_rl.install_sim import MAX_SIMS, install_sim, sim_test_file
 
 POKEROGUE_DIR = Path(__file__).resolve().parent.parent / "pokerogue"
-NUM_ACTIONS = 10  # 0-3: move slots, 4+k: switch to party slot k
 
 
 class SimError(RuntimeError):
     pass
 
 
-def free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+def free_ports(n: int) -> int:
+    """First of n consecutive free localhost ports."""
+    for _ in range(100):
+        base = random.randint(20000, 60000 - n)
+        try:
+            socks = []
+            for port in range(base, base + n):
+                s = socket.socket()
+                socks.append(s)
+                s.bind(("127.0.0.1", port))
+            return base
+        except OSError:
+            continue
+        finally:
+            for s in socks:
+                s.close()
+    raise SimError(f"no {n} consecutive free ports found")
+
+
+class SimGroup:
+    """One Vitest process hosting several simulators, each with its own client."""
+
+    def __init__(self, proc: subprocess.Popen, clients: list[SimClient]):
+        self.proc = proc
+        self.clients = clients
+
+    def close(self) -> None:
+        for client in self.clients:
+            client.close()
+        try:
+            self.proc.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+
+
+def launch_sims(n: int, log_path: str | os.PathLike | None = None,
+                request_timeout: float | None = None) -> SimGroup:
+    """Start one Vitest process running n simulators and connect a client to each."""
+    if not 1 <= n <= MAX_SIMS:
+        raise ValueError(f"can host 1-{MAX_SIMS} simulators per process, got {n}")
+    install_sim()
+    base = free_ports(n)
+    log = open(log_path, "w") if log_path else subprocess.DEVNULL
+    proc = subprocess.Popen(
+        ["pnpm", "exec", "vitest", "run", "--silent", f"--maxWorkers={n}",
+         *(f"test/rl/{sim_test_file(i)}" for i in range(n))],
+        cwd=POKEROGUE_DIR,
+        env={**os.environ, "RL_PORT": str(base), "RL_SIMS": str(n)},
+        stdout=log,
+        stderr=subprocess.STDOUT,
+    )
+    clients = [SimClient(base + i, proc=proc, request_timeout=request_timeout) for i in range(n)]
+    return SimGroup(proc, clients)
 
 
 class SimClient:
-    def __init__(self, port: int, host: str = "127.0.0.1", connect_timeout: float = 120.0,
-                 proc: subprocess.Popen | None = None, request_timeout: float | None = None):
+    def __init__(self, port: int, host: str = "127.0.0.1", connect_timeout: float = 180.0,
+                 proc: subprocess.Popen | None = None, request_timeout: float | None = None,
+                 owns_proc: bool = False):
         self.proc = proc
+        self.owns_proc = owns_proc
         deadline = time.monotonic() + connect_timeout
         while True:
             try:
@@ -51,18 +103,10 @@ class SimClient:
 
     @classmethod
     def launch(cls, log_path: str | os.PathLike | None = None, request_timeout: float | None = None) -> SimClient:
-        """Start a simulator process on a free port and connect to it."""
-        install_sim()
-        port = free_port()
-        log = open(log_path, "w") if log_path else subprocess.DEVNULL
-        proc = subprocess.Popen(
-            ["pnpm", "exec", "vitest", "run", "test/rl/sim-server.test.ts", "--silent"],
-            cwd=POKEROGUE_DIR,
-            env={**os.environ, "RL_PORT": str(port)},
-            stdout=log,
-            stderr=subprocess.STDOUT,
-        )
-        return cls(port, proc=proc, request_timeout=request_timeout)
+        """Start a single-simulator process and connect to it; closing the client stops it."""
+        client = launch_sims(1, log_path, request_timeout).clients[0]
+        client.owns_proc = True
+        return client
 
     def _request(self, msg: dict) -> dict:
         self.sock.sendall((json.dumps(msg) + "\n").encode())
@@ -89,13 +133,13 @@ class SimClient:
         return self._request({"cmd": "step", "action": int(action)})
 
     def close(self) -> None:
-        """Disconnect; also shut the server down if this client launched it."""
+        """Disconnect; stop the simulator if it was launched for us (and its process, if we own it)."""
         try:
             self._request({"cmd": "shutdown" if self.proc is not None else "close"})
         except (SimError, OSError):
             pass
         self.sock.close()
-        if self.proc is not None:
+        if self.owns_proc:
             try:
                 self.proc.wait(timeout=30)
             except subprocess.TimeoutExpired:

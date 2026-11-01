@@ -21,11 +21,10 @@
  * Remaining inputs (biome choice, prompts) are handled by scripted defaults in
  * `watchdogTick` and counted in `info.autoInputs`.
  *
- * Only runs when RL_PORT is set, so normal `pnpm test` runs skip it.
- *
- * Source of truth is sim/ in the Pokerogue RL repo; pokerogue/test/rl/ holds a copy made by
- * `python -m pokerogue_rl.install_sim` (Vite can't load test files from outside pokerogue/).
- * Start: RL_PORT=5555 pnpm exec vitest run test/rl/sim-server.test.ts
+ * Source of truth is sim/ in the Pokerogue RL repo; pokerogue/test/rl/ holds a copy plus generated
+ * per-simulator test files, made by `python -m pokerogue_rl.install_sim` (Vite can't load test files
+ * from outside pokerogue/). See defineSimServer for how simulators are started.
+ * Start 4 simulators on ports 5555-5558: RL_PORT=5555 RL_SIMS=4 pnpm exec vitest run test/rl --maxWorkers=4
  */
 
 import { BattleScene } from "#app/battle-scene";
@@ -65,23 +64,25 @@ import type { Move } from "#moves/move";
 import { getMoveTargets } from "#moves/move-utils";
 import type { AttemptCapturePhase } from "#phases/attempt-capture-phase";
 import type { CommandPhase } from "#phases/command-phase";
-import type { LearnMovePhase } from "#phases/learn-move-phase";
+import { LearnMovePhase } from "#phases/learn-move-phase";
 import type { PokemonPhase } from "#phases/pokemon-phase";
 import type { SelectModifierPhase } from "#phases/select-modifier-phase";
 import { SelectStarterPhase } from "#phases/select-starter-phase";
 import { GameManager } from "#test/framework/game-manager";
+import { MockContainer } from "#test/mocks/mocks-container/mock-container";
 import { PromptHandler } from "#test/helpers/prompt-handler";
 import { generateStarters } from "#test/utils/game-manager-utils";
 import type { StarterMoveset } from "#types/save-data";
 import type { StarterSpeciesId } from "#types/starter-species-id";
+import { BattleFlyout } from "#ui/battle-flyout";
 import { PartyOption } from "#ui/party-ui-handler";
 import { getStarterMoves } from "#ui/utils/starter-select-ui-utils";
 import { NumberHolder, randomString } from "#utils/common";
 import net from "node:net";
+import v8 from "node:v8";
 import Phaser from "phaser";
 import { it, vi } from "vitest";
 
-const PORT = Number(process.env.RL_PORT ?? 0);
 /** Command actions: 0-3 moves, 4-9 switch to party slot, 10-14 throw ball type (Poke, Great, Ultra, Rogue, Master). */
 const NUM_COMMAND_ACTIONS = 15;
 const NUM_BALL_TYPES = 5;
@@ -99,6 +100,49 @@ const STALL_TIMEOUT_MS = 10_000;
 
 // GameManager forces max rolls on battle RNG for deterministic tests; keep the real one for RL.
 const realRandBattleSeedInt = BattleScene.prototype.randBattleSeedInt;
+
+// MockContainer.removeAll ignores destroyChild and MockContainer.destroy only empties its list, so
+// UI rebuilt this way (party slots, battle info parts, menus) never destroys its old children,
+// whose listeners and sprites then live forever. Destroy children as real Phaser does.
+(MockContainer.prototype as any).removeAll = function (this: MockContainer, destroyChild = false) {
+  const children = this.list;
+  this.list = [];
+  if (destroyChild) {
+    for (const child of children) {
+      (child as any).destroy?.();
+    }
+  }
+  return this;
+};
+MockContainer.prototype.destroy = function (this: MockContainer) {
+  (this as any).removeAll(true);
+};
+
+// Each enemy's BattleFlyout subscribes to globalScene.eventTarget in initInfo and only unsubscribes
+// when destroyed, which under the mocks never happens: every past enemy (with its sprites) stays
+// alive and keeps receiving events. Track flyouts so pruneLeaks can destroy stale ones.
+const liveFlyouts = new Set<BattleFlyout>();
+const realFlyoutInitInfo = BattleFlyout.prototype.initInfo;
+BattleFlyout.prototype.initInfo = function (this: BattleFlyout, pokemon: EnemyPokemon) {
+  liveFlyouts.add(this);
+  return realFlyoutInitInfo.call(this, pokemon);
+};
+
+// LearnMovePhase asks "replace a move?" via a CONFIRM prompt, and a scripted answer loops
+// ("no" -> "stop trying?" -> "no" -> "replace?"). Answer it here for every instance: the agent's
+// choice if it made one (see the learn_move decision), otherwise decline.
+const learnMoveChoices = new WeakMap<LearnMovePhase, number>();
+let onUnattendedLearnMove: () => void = () => {};
+(LearnMovePhase.prototype as any).replaceMoveCheck = function (this: any, move: Move, pokemon: Pokemon) {
+  const choice = learnMoveChoices.get(this);
+  if (choice === undefined) {
+    onUnattendedLearnMove();
+  }
+  if (choice !== undefined && choice < 4) {
+    return this.learnMove(choice, move, pokemon);
+  }
+  this.end();
+};
 
 function log(msg: string): void {
   process.stderr.write(`[sim] ${msg}\n`);
@@ -155,7 +199,9 @@ class Sim {
   /** The scene's MockClock, patched by installManualClock. */
   private clock: any;
 
-  constructor(private readonly phaserGame: Phaser.Game) {}
+  constructor(private readonly phaserGame: Phaser.Game) {
+    onUnattendedLearnMove = () => this.count("learn_move_default");
+  }
 
   private get scene(): BattleScene {
     return this.game.scene;
@@ -180,6 +226,7 @@ class Sim {
     BattleScene.prototype.randBattleSeedInt = realRandBattleSeedInt;
     this.installCaptureCounter();
     this.installManualClock();
+    this.restoreBaseline();
     this.manualClock = false; // the test framework's helpers below need the wall-clock interval
     this.game.settings.battleStyle(BattleStyle.SET);
     this.maxWave = opts.maxWave ?? Number.POSITIVE_INFINITY;
@@ -300,6 +347,114 @@ class Sim {
     tweens.rlCaptureCounter = true;
   }
 
+  /**
+   * Leak control. The test harness never frees what a run creates: the mock texture manager lists
+   * every object it makes, destroyed Pokemon stay in mock containers (which don't track parents),
+   * stale flyouts and the tera sparkle handler pin old sprites, and destroyed TimerEvents stay on
+   * the clock and are walked every tick. Unchecked, a worker's speed halved within ~50 episodes.
+   */
+  private baseline?: { field: Set<unknown>; fieldUI: Set<unknown>; events: Set<unknown> };
+
+  /** On the first reset, record the scene's structures; on later resets, cut them back to that. */
+  private restoreBaseline() {
+    const scene = this.scene as any;
+    if (!this.baseline) {
+      this.baseline = {
+        field: new Set(scene.field.list),
+        fieldUI: new Set(scene.fieldUI.list),
+        events: new Set(scene.time._active),
+      };
+      return;
+    }
+    const { field, fieldUI, events } = this.baseline;
+    scene.field.list = scene.field.list.filter((o: unknown) => field.has(o));
+    scene.fieldUI.list = scene.fieldUI.list.filter((o: unknown) => fieldUI.has(o));
+    scene.time._active = scene.time._active.filter((e: unknown) => events.has(e));
+    this.pruneLeaks();
+  }
+
+  /** Within a run, once per wave: drop destroyed Phaser objects and dead timers. */
+  private pruneLeaks() {
+    const scene = this.scene as any;
+    const alive = (o: any) => !(o instanceof Phaser.GameObjects.GameObject) || o.scene !== undefined;
+    scene.field.list = scene.field.list.filter(alive);
+    scene.fieldUI.list = scene.fieldUI.list.filter(alive);
+    scene.time._active = scene.time._active.filter((e: any) => e.callback !== undefined);
+    // Unsubscribe flyouts of enemies no longer on the field (see liveFlyouts).
+    const enemies = new Set(scene.getEnemyField());
+    for (const flyout of liveFlyouts) {
+      if (!enemies.has((flyout as any).pokemon)) {
+        flyout.destroy();
+        liveFlyouts.delete(flyout);
+      }
+    }
+    // The tera sparkle handler drops a sprite once its `scene` is cleared, which mock sprites never
+    // do, so it holds every Pokemon sprite ever shown. It's purely visual.
+    scene.spriteTeraSparkleHandler.removeAll();
+    // scene.textures is the harness's MockTextureManager, whose `list` records every mock object
+    // it ever creates (each holding a real Phaser sprite) and is never read. The biggest leak.
+    scene.textures.list.length = 0;
+    // Every Phaser sprite's AnimationState subscribes to the AnimationManager's "remove" event and
+    // unsubscribes on destroy, which mock-wrapped sprites never get. Animations are never removed
+    // during play, so these listeners only pin dead sprites.
+    scene.anims.removeAllListeners("remove");
+    // The harness records every battle message and phase name for the whole episode.
+    this.game.textInterceptor.clearLogs();
+    this.game.phaseInterceptor.clearLogs();
+    // The harness's spies and vi.fn mocks (fetch, UI mode changes, ...) record every call's
+    // arguments until cleared. Only their implementations matter here.
+    vi.clearAllMocks();
+  }
+
+  /** What the accumulating clock timers and textures are. */
+  debugDetail(): Record<string, unknown> {
+    const scene = this.scene as any;
+    const count = (keys: string[]) => {
+      const c: Record<string, number> = {};
+      for (const k of keys) {
+        c[k] = (c[k] ?? 0) + 1;
+      }
+      return [...Object.entries(c)].sort((a, b) => b[1] - a[1]).slice(0, 8);
+    };
+    const events = (scene.time?._active ?? []).map(
+      (e: any) => `loop=${e.loop} repeat=${e.repeat} delay=${e.delay} cb=${String(e.callback).replace(/\s+/g, " ").slice(0, 80)}`,
+    );
+    const textureKeys = Object.keys(scene.textures?.list ?? {});
+    return {
+      events: count(events),
+      texturePrefixes: count(textureKeys.map(k => k.replace(/[0-9]+.*$/, "#"))),
+      textureSample: textureKeys.slice(-5),
+      fieldTypes: count((scene.field?.list ?? []).map((o: any) => `${o.constructor?.name}:${o.scene ? "live" : "destroyed"}`)),
+      fieldUITypes: count((scene.fieldUI?.list ?? []).map((o: any) => `${o.constructor?.name}:${o.scene ? "live" : "destroyed"}`)),
+    };
+  }
+
+  /** Sizes of long-lived scene structures, for tracking down leaks across episodes. */
+  debugStats(): Record<string, number> {
+    const scene = this.scene as any;
+    const len = (x: any) => (Array.isArray(x) ? x.length : (x?.list?.length ?? x?.size ?? -1));
+    const mem = process.memoryUsage();
+    return {
+      heapUsedMB: Math.round(mem.heapUsed / 2 ** 20),
+      rssMB: Math.round(mem.rss / 2 ** 20),
+      children: len(scene.children),
+      field: len(scene.field),
+      fieldUI: len(scene.fieldUI),
+      uiContainer: len(scene.uiContainer),
+      clockActive: len(scene.time?._active),
+      clockPending: len(scene.time?._pendingInsertion),
+      updateList: len(scene.sys?.updateList?._active),
+      modifiers: len(scene.modifiers),
+      enemyModifiers: len(scene.enemyModifiers),
+      phaseQueue: len(scene.phaseManager?.["phaseQueue"]),
+      gameEvents: scene.game?.events?.eventNames?.().length ?? -1,
+      sceneEvents: scene.events?.eventNames?.().reduce((n: number, e: any) => n + scene.events.listenerCount(e), 0) ?? -1,
+      mockObjects: scene.textures?.list?.length ?? -1,
+      animsCache: scene.anims?.anims?.size ?? -1,
+      domNodes: document.getElementsByTagName("*").length,
+    };
+  }
+
   async step(action: number) {
     const decision = this.decision;
     if (!decision) {
@@ -363,14 +518,10 @@ class Sim {
         this.scene.phaseManager.shiftPhase(); // the SelectTargetPhase was never started
         return this.advance();
 
-      case "learn_move": {
-        const phase = decision.phase as any;
-        // Answer the "replace a move?" prompt ourselves instead of through the UI.
-        phase.replaceMoveCheck =
-          action < 4 ? (move: Move, pokemon: Pokemon) => phase.learnMove(action, move, pokemon) : () => phase.end();
+      case "learn_move":
+        learnMoveChoices.set(decision.phase, action); // read by the patched replaceMoveCheck
         this.approvedLearnMove = decision.phase;
         return this.advance();
-      }
 
       case "faint_switch": {
         const handler = this.scene.ui.getHandler() as any;
@@ -525,6 +676,7 @@ class Sim {
     if (wave !== this.decisionWave) {
       this.decisionWave = wave;
       this.decisionsThisWave = 0;
+      this.pruneLeaks();
     }
     if (++this.decisionsThisWave > MAX_DECISIONS_PER_WAVE) {
       this.decision = undefined;
@@ -940,7 +1092,7 @@ class Sim {
   // #endregion
 }
 
-function serve(sim: Sim): Promise<void> {
+function serve(sim: Sim, port: number): Promise<void> {
   return new Promise((resolve, reject) => {
     const server = net.createServer(socket => {
       let buffer = "";
@@ -972,6 +1124,12 @@ function serve(sim: Sim): Promise<void> {
               send({ ok: true });
               socket.end();
               break;
+            case "debug":
+              send({ ok: true, stats: sim.debugStats(), detail: req.detail ? sim.debugDetail() : undefined });
+              break;
+            case "heapsnapshot":
+              send({ ok: true, path: v8.writeHeapSnapshot(req.path) });
+              break;
             case "shutdown":
               send({ ok: true });
               socket.end();
@@ -988,7 +1146,7 @@ function serve(sim: Sim): Promise<void> {
       }
     });
     server.on("error", reject);
-    server.listen(PORT, "127.0.0.1", () => {
+    server.listen(port, "127.0.0.1", () => {
       log(`listening on 127.0.0.1:${(server.address() as net.AddressInfo).port}`);
     });
   });
@@ -1007,12 +1165,22 @@ function silenceConsole(): void {
   console.error = (...data: unknown[]) => log(`console.error: ${data.map(String).join(" ")}`);
 }
 
-it.skipIf(!process.env.RL_PORT)(
-  "RL simulator server",
-  async () => {
-    silenceConsole();
-    const phaserGame = new Phaser.Game({ type: Phaser.HEADLESS });
-    await serve(new Sim(phaserGame));
-  },
-  2 ** 31 - 1,
-);
+/**
+ * Register simulator `index` as a never-ending Vitest test. Vitest runs each test file in its own
+ * worker, so the generated test/rl/sim-NN.test.ts files (one per simulator) let one Vitest process
+ * host RL_SIMS simulators on ports RL_PORT, RL_PORT+1, ... while sharing its ~1.3GB main process.
+ * Skipped unless RL_PORT is set, so normal `pnpm test` runs ignore it.
+ */
+export function defineSimServer(index: number): void {
+  const basePort = Number(process.env.RL_PORT ?? 0);
+  const count = Number(process.env.RL_SIMS ?? 1);
+  it.skipIf(!process.env.RL_PORT || index >= count)(
+    `RL simulator ${index}`,
+    async () => {
+      silenceConsole();
+      const phaserGame = new Phaser.Game({ type: Phaser.HEADLESS });
+      await serve(new Sim(phaserGame), basePort + index);
+    },
+    2 ** 31 - 1,
+  );
+}

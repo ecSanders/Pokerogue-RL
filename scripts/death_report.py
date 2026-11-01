@@ -18,7 +18,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from pokerogue_rl.agents import AGENTS  # noqa: E402
-from pokerogue_rl.sim_client import SimClient  # noqa: E402
+from pokerogue_rl.sim_client import SimClient, launch_sims  # noqa: E402
 
 
 def team_summary(party: list[dict]) -> dict:
@@ -77,19 +77,18 @@ def play(sim: SimClient, agent, seed: str, max_wave: int) -> dict:
     }
 
 
-def worker(args, jobs: queue.Queue, records: list, lock: threading.Lock) -> None:
+def worker(sim: SimClient, args, jobs: queue.Queue, records: list, lock: threading.Lock) -> None:
     agent = AGENTS[args.agent]()
-    with SimClient.launch(request_timeout=120) as sim:
-        while True:
-            try:
-                ep = jobs.get_nowait()
-            except queue.Empty:
-                return
-            rec = play(sim, agent, f"{args.seed}-{ep}", args.max_wave)
-            with lock:
-                records.append(rec)
-                print(f"run {ep}: died wave {rec['wave']} ({rec['battle_type']}"
-                      f"{' ' + rec['trainer'] if rec['trainer'] else ''})", flush=True)
+    while True:
+        try:
+            ep = jobs.get_nowait()
+        except queue.Empty:
+            return
+        rec = play(sim, agent, f"{args.seed}-{ep}", args.max_wave)
+        with lock:
+            records.append(rec)
+            print(f"run {ep}: died wave {rec['wave']} ({rec['battle_type']}"
+                  f"{' ' + rec['trainer'] if rec['trainer'] else ''})", flush=True)
 
 
 def pct(n: int, total: int) -> str:
@@ -163,11 +162,13 @@ def main() -> None:
         jobs.put(ep)
     records: list = []
     lock = threading.Lock()
-    threads = [threading.Thread(target=worker, args=(args, jobs, records, lock)) for _ in range(args.workers)]
+    group = launch_sims(args.workers, request_timeout=120)
+    threads = [threading.Thread(target=worker, args=(sim, args, jobs, records, lock)) for sim in group.clients]
     for t in threads:
         t.start()
     for t in threads:
         t.join()
+    group.close()
 
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)

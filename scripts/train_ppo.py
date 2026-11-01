@@ -42,6 +42,10 @@ def parse_args():
     p.add_argument("--vf-coef", type=float, default=0.5)
     p.add_argument("--max-grad-norm", type=float, default=0.5)
     p.add_argument("--init", help="checkpoint to start from (e.g. behaviour-cloned policy)")
+    p.add_argument("--resume", action="store_true",
+                   help="continue runs/<name>/policy.pt: weights, optimizer, update count and LR schedule")
+    p.add_argument("--recycle-every", type=int, default=100,
+                   help="updates between simulator restarts (bounds a slow per-episode memory leak)")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--save-every", type=int, default=10, help="updates between checkpoints")
     return p.parse_args()
@@ -56,9 +60,15 @@ def main() -> None:
     (out / "config.json").write_text(json.dumps(vars(args), indent=2))
 
     policy = BattlePolicy().to(device)
-    if args.init:
-        policy.load_state_dict(torch.load(args.init, map_location=device)["policy"])
     optimizer = torch.optim.Adam(policy.parameters(), lr=args.lr, eps=1e-5)
+    first_update, global_step = 1, 0
+    if args.resume:
+        ckpt = torch.load(out / "policy.pt", map_location=device)
+        policy.load_state_dict(ckpt["policy"])
+        optimizer.load_state_dict(ckpt["optimizer"])
+        first_update, global_step = ckpt["update"] + 1, ckpt["step"]
+    elif args.init:
+        policy.load_state_dict(torch.load(args.init, map_location=device)["policy"])
 
     envs = VecBattleEnv(args.num_envs, seed_prefix=args.name, max_wave=args.max_wave,
                         reward=RewardConfig(gamma=args.gamma))
@@ -67,16 +77,15 @@ def main() -> None:
     batch_size = n * t_len
     num_updates = args.total_steps // batch_size
     recent = collections.deque(maxlen=100)  # finished episodes
-    global_step = 0
     start = time.time()
 
-    for update in range(1, num_updates + 1):
+    for update in range(first_update, num_updates + 1):
         # Linear learning-rate decay.
         for g in optimizer.param_groups:
             g["lr"] = args.lr * (1 - (update - 1) / num_updates)
 
         feats, actions, logps, values, rewards, dones = [], [], [], [], [], []
-        invalid = 0
+        invalid = sim_errors = 0
         rollout_start = time.time()
         for _ in range(t_len):
             enc = F.stack([F.encode(o) for o in obs])
@@ -93,6 +102,7 @@ def main() -> None:
             dones.append(torch.as_tensor(done, device=device, dtype=torch.float32))
             for info in infos:
                 invalid += info["invalid"]
+                sim_errors += "sim_error" in info
                 if "episode" in info:
                     recent.append(info["episode"])
         global_step += batch_size
@@ -151,6 +161,7 @@ def main() -> None:
             "wave_median": float(np.median(waves)) if waves else None,
             "return_mean": round(float(np.mean([e["return"] for e in recent])), 3) if recent else None,
             "invalid": invalid,
+            "sim_errors": sim_errors,
             **{k: round(float(np.mean(v)), 4) for k, v in stats.items()},
         }
         with (out / "log.jsonl").open("a") as f:
@@ -158,8 +169,10 @@ def main() -> None:
         print(" ".join(f"{k}={v}" for k, v in row.items()), flush=True)
 
         if update % args.save_every == 0 or update == num_updates:
-            torch.save({"policy": policy.state_dict(), "update": update, "step": global_step,
-                        "args": vars(args)}, out / "policy.pt")
+            torch.save({"policy": policy.state_dict(), "optimizer": optimizer.state_dict(), "update": update,
+                        "step": global_step, "args": vars(args)}, out / "policy.pt")
+        if update % args.recycle_every == 0 and update < num_updates:
+            obs = envs.recycle()
 
     envs.close()
 

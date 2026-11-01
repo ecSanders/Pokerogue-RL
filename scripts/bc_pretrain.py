@@ -23,6 +23,7 @@ sys.path.insert(0, str(ROOT))
 
 from pokerogue_rl import features as F  # noqa: E402
 from pokerogue_rl.env import BattleEnv, RewardConfig  # noqa: E402
+from pokerogue_rl.sim_client import launch_sims  # noqa: E402
 from pokerogue_rl.policy import BattlePolicy  # noqa: E402
 
 
@@ -68,11 +69,14 @@ def main() -> None:
 
     t0 = time.time()
     per_env = args.steps // args.num_envs
+    group = launch_sims(args.num_envs, request_timeout=120)
+    envs = [BattleEnv(i, seed_prefix=args.name, reward=RewardConfig(gamma=args.gamma), sim=sim)
+            for i, sim in enumerate(group.clients)]
     with ThreadPoolExecutor(args.num_envs) as pool:
-        envs = list(pool.map(lambda i: BattleEnv(i, seed_prefix=args.name, reward=RewardConfig(gamma=args.gamma)),
-                             range(args.num_envs)))
         parts = list(pool.map(lambda e: collect(e, per_env, args.gamma), envs))
-        list(pool.map(lambda e: e.close(), envs))
+    for e in envs:
+        e.close()
+    group.close()
     feats = [f for part in parts for f in part[0]]
     data = {k: torch.as_tensor(np.stack([f[k] for f in feats]), device=device) for k in feats[0]}
     actions = torch.as_tensor([a for part in parts for a in part[1]], device=device)

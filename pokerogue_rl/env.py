@@ -20,7 +20,7 @@ import numpy as np
 
 from pokerogue_rl.agents.heuristic import HeuristicAgent
 from pokerogue_rl.features import BATTLE_KINDS
-from pokerogue_rl.sim_client import SimClient
+from pokerogue_rl.sim_client import SimClient, SimError, launch_sims
 
 
 @dataclass
@@ -41,9 +41,11 @@ def enemy_health(obs: dict) -> float:
 
 class BattleEnv:
     def __init__(self, env_id: int, seed_prefix: str = "train", max_wave: int = 500,
-                 reward: RewardConfig | None = None, sim_kwargs: dict | None = None):
-        self.sim = SimClient.launch(request_timeout=120, **(sim_kwargs or {}))
+                 reward: RewardConfig | None = None, sim: SimClient | None = None):
+        """`sim`: a client from a shared simulator group; launches its own simulator if omitted."""
+        self.sim = sim or SimClient.launch(request_timeout=120)
         self.helper = HeuristicAgent()
+        self.sim_errors = 0
         self.reward_cfg = reward or RewardConfig()
         self.max_wave = max_wave
         self.seeds = (f"{seed_prefix}-{env_id}-{i}" for i in itertools.count())
@@ -57,11 +59,27 @@ class BattleEnv:
             resp = self.sim.step(self.helper.act(resp["obs"]))
         return resp
 
+    def _restart_sim(self, error: Exception) -> None:
+        """Replace a simulator that errored or hung, so one bad episode can't end a training run."""
+        self.sim_errors += 1
+        print(f"[env] simulator error ({error!r}); replacing it with a standalone one", flush=True)
+        if self.sim.owns_proc:
+            self.sim.proc.kill()
+        self.sim.sock.close()  # a simulator in a shared group is abandoned, not killed
+        self.sim = SimClient.launch(request_timeout=120)
+
     def reset(self) -> dict:
+        try:
+            return self._reset()
+        except (SimError, OSError) as e:  # socket.timeout is an OSError
+            self._restart_sim(e)
+            return self._reset()
+
+    def _reset(self) -> dict:
         self.helper.reset()
         resp = self._play_until_battle(self.sim.reset(seed=next(self.seeds), max_wave=self.max_wave))
         if resp["done"]:  # ended before any battle decision; try another seed
-            return self.reset()
+            return self._reset()
         self.obs = resp["obs"]
         self.episode_return = 0.0
         self.episode_steps = 0
@@ -70,7 +88,12 @@ class BattleEnv:
     def step(self, action: int) -> tuple[dict, float, bool, dict]:
         prev = self.obs
         self.helper._update_carry(prev["party"])  # the heuristic's item choices follow its carry
-        resp = self._play_until_battle(self.sim.step(int(action)))
+        try:
+            resp = self._play_until_battle(self.sim.step(int(action)))
+        except (SimError, OSError) as e:
+            # End the episode with no reward; GAE stops at done, so nothing bootstraps across it.
+            self._restart_sim(e)
+            return self.reset(), 0.0, True, {"invalid": False, "sim_error": repr(e)}
         obs, done = resp["obs"], resp["done"]
 
         cfg = self.reward_cfg
@@ -96,11 +119,11 @@ class BattleEnv:
 
 
 class VecBattleEnv:
-    """N BattleEnvs stepped in parallel threads (each blocks on its own simulator process)."""
+    """N BattleEnvs on one shared simulator process, stepped in parallel threads."""
 
     def __init__(self, num_envs: int, **kwargs):
-        with ThreadPoolExecutor(num_envs) as pool:
-            self.envs = list(pool.map(lambda i: BattleEnv(i, **kwargs), range(num_envs)))
+        self.group = launch_sims(num_envs, request_timeout=120)
+        self.envs = [BattleEnv(i, sim=client, **kwargs) for i, client in enumerate(self.group.clients)]
         self.pool = ThreadPoolExecutor(num_envs)
 
     def reset(self) -> list[dict]:
@@ -111,6 +134,19 @@ class VecBattleEnv:
         obs, rewards, dones, infos = zip(*results)
         return list(obs), np.array(rewards, np.float32), np.array(dones, bool), list(infos)
 
+    def recycle(self) -> list[dict]:
+        """Restart all simulators (a slow per-episode leak remains) and start fresh episodes.
+
+        Call between rollouts: in-progress episodes are dropped, not reported as finished.
+        """
+        list(self.pool.map(lambda e: e.close(), self.envs))
+        self.group.close()
+        self.group = launch_sims(len(self.envs), request_timeout=120)
+        for env, client in zip(self.envs, self.group.clients):
+            env.sim = client
+        return self.reset()
+
     def close(self) -> None:
         list(self.pool.map(lambda e: e.close(), self.envs))
         self.pool.shutdown()
+        self.group.close()

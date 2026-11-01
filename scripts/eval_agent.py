@@ -16,33 +16,32 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from pokerogue_rl.agents import AGENTS  # noqa: E402
-from pokerogue_rl.sim_client import SimClient  # noqa: E402
+from pokerogue_rl.sim_client import SimClient, launch_sims  # noqa: E402
 
 
-def worker(worker_id: int, args, jobs: queue.Queue, results: list, lock: threading.Lock) -> None:
+def worker(worker_id: int, sim: SimClient, args, jobs: queue.Queue, results: list, lock: threading.Lock) -> None:
     agent = AGENTS[args.agent]()
-    with SimClient.launch() as sim:
-        while True:
-            try:
-                ep = jobs.get_nowait()
-            except queue.Empty:
-                return
-            resp = sim.reset(seed=f"{args.seed}-{ep}", max_wave=args.max_wave)
-            agent.reset()
-            steps, kinds = 0, Counter()
-            t0 = time.perf_counter()
-            while not resp["done"]:
-                kinds[resp["obs"]["kind"]] += 1
-                resp = sim.step(agent.act(resp["obs"]))
-                steps += 1
-            elapsed = time.perf_counter() - t0
-            with lock:
-                results.append({
-                    "episode": ep, "wave": resp["obs"]["wave"], "reason": resp["info"]["reason"],
-                    "steps": steps, "time": elapsed, "kinds": kinds, "auto": resp["info"]["autoInputs"],
-                })
-                print(f"[w{worker_id}] episode {ep}: wave {resp['obs']['wave']} ({resp['info']['reason']}), "
-                      f"{steps} steps, {steps / max(elapsed, 1e-9):.0f} steps/s", flush=True)
+    while True:
+        try:
+            ep = jobs.get_nowait()
+        except queue.Empty:
+            return
+        resp = sim.reset(seed=f"{args.seed}-{ep}", max_wave=args.max_wave)
+        agent.reset()
+        steps, kinds = 0, Counter()
+        t0 = time.perf_counter()
+        while not resp["done"]:
+            kinds[resp["obs"]["kind"]] += 1
+            resp = sim.step(agent.act(resp["obs"]))
+            steps += 1
+        elapsed = time.perf_counter() - t0
+        with lock:
+            results.append({
+                "episode": ep, "wave": resp["obs"]["wave"], "reason": resp["info"]["reason"],
+                "steps": steps, "time": elapsed, "kinds": kinds, "auto": resp["info"]["autoInputs"],
+            })
+            print(f"[w{worker_id}] episode {ep}: wave {resp['obs']['wave']} ({resp['info']['reason']}), "
+                  f"{steps} steps, {steps / max(elapsed, 1e-9):.0f} steps/s", flush=True)
 
 
 def main() -> None:
@@ -61,11 +60,14 @@ def main() -> None:
     lock = threading.Lock()
 
     t0 = time.perf_counter()
-    threads = [threading.Thread(target=worker, args=(i, args, jobs, results, lock)) for i in range(args.workers)]
+    group = launch_sims(args.workers)
+    threads = [threading.Thread(target=worker, args=(i, sim, args, jobs, results, lock))
+               for i, sim in enumerate(group.clients)]
     for t in threads:
         t.start()
     for t in threads:
         t.join()
+    group.close()
     wall = time.perf_counter() - t0
 
     waves = sorted(r["wave"] for r in results)
