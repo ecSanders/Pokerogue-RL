@@ -16,7 +16,7 @@ sys.path.insert(0, str(ROOT))
 
 from pokerogue_rl import features as F  # noqa: E402
 from pokerogue_rl.env import BattleEnv, VecBattleEnv  # noqa: E402
-from pokerogue_rl.policy import BattlePolicy, to_tensors  # noqa: E402
+from pokerogue_rl.policy import AgentPolicy, BattlePolicy, to_tensors  # noqa: E402
 
 
 def main() -> None:
@@ -84,8 +84,8 @@ def profile_async(args) -> None:
     from pokerogue_rl.rollout import collect
 
     torch.set_num_threads(1)
-    policy = BattlePolicy()
-    policy.load_state_dict(torch.load(args.init, map_location="cpu")["policy"])
+    policy = AgentPolicy()
+    policy.load_checkpoint(args.init)
     envs = VecBattleEnv(args.num_envs, seed_prefix="profile")
     envs.reset()
     start = time.perf_counter()

@@ -1,11 +1,13 @@
-"""Behaviour-clone the heuristic's battle decisions to warm-start PPO.
+"""Behaviour-clone the heuristic's battle or run decisions to warm-start PPO.
 
-Collects (observation, heuristic action, discounted return) for battle decisions, then trains the
-policy head with cross-entropy and the value head on the returns.
+Collects (observation, heuristic action, discounted return) for one decision group, then trains
+that half of AgentPolicy: the policy head with cross-entropy, the value head on the returns.
 
 Usage:
   python scripts/bc_pretrain.py --steps 200000 --name bc
   python scripts/train_ppo.py --name ppo-bc --init runs/bc/policy.pt
+  python scripts/bc_pretrain.py --kinds run --steps 100000 --name bc-run
+  python scripts/train_ppo.py --name run-v1 --run-policy --init runs/ppo-v5/policy.pt --run-init runs/bc-run/policy.pt
 """
 
 import argparse
@@ -22,19 +24,22 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from pokerogue_rl import features as F  # noqa: E402
+from pokerogue_rl import run_features as RF  # noqa: E402
 from pokerogue_rl.env import BattleEnv, RewardConfig  # noqa: E402
+from pokerogue_rl.policy import AgentPolicy  # noqa: E402
 from pokerogue_rl.sim_client import launch_sims  # noqa: E402
-from pokerogue_rl.policy import BattlePolicy  # noqa: E402
+
+GROUPS = {"battle": (F.BATTLE_KINDS, F.encode), "run": (RF.RUN_KINDS, RF.encode)}
 
 
-def collect(env: BattleEnv, steps: int, gamma: float) -> tuple[list[dict], list[int], list[float]]:
-    """Play the heuristic for `steps` battle decisions; returns are computed per finished episode."""
+def collect(env: BattleEnv, steps: int, gamma: float, encode) -> tuple[list[dict], list[int], list[float]]:
+    """Play the heuristic for `steps` policy decisions; returns are computed per finished episode."""
     feats, actions, returns = [], [], []
     episode_feats, episode_actions, episode_rewards = [], [], []
     obs = env.reset()
     while len(feats) < steps:
         action = env.helper.act(obs)
-        episode_feats.append(F.encode(obs))
+        episode_feats.append(encode(obs))
         episode_actions.append(action)
         obs, reward, done, _ = env.step(action)
         episode_rewards.append(reward)
@@ -54,8 +59,11 @@ def collect(env: BattleEnv, steps: int, gamma: float) -> tuple[list[dict], list[
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--name", default="bc")
-    p.add_argument("--steps", type=int, default=200_000, help="battle decisions to collect")
+    p.add_argument("--kinds", choices=GROUPS, default="battle", help="which decisions to clone")
+    p.add_argument("--steps", type=int, default=200_000, help="decisions to collect")
     p.add_argument("--num-envs", type=int, default=12)
+    p.add_argument("--round-steps", type=int, default=2000,
+                   help="decisions per env before its simulator is restarted")
     p.add_argument("--epochs", type=int, default=10)
     p.add_argument("--batch", type=int, default=1024)
     p.add_argument("--lr", type=float, default=1e-3)
@@ -68,22 +76,29 @@ def main() -> None:
     out.mkdir(parents=True, exist_ok=True)
 
     t0 = time.time()
-    per_env = args.steps // args.num_envs
-    group = launch_sims(args.num_envs, request_timeout=120)
-    envs = [BattleEnv(i, seed_prefix=args.name, reward=RewardConfig(gamma=args.gamma), sim=sim)
-            for i, sim in enumerate(group.clients)]
-    with ThreadPoolExecutor(args.num_envs) as pool:
-        parts = list(pool.map(lambda e: collect(e, per_env, args.gamma), envs))
-    for e in envs:
-        e.close()
-    group.close()
+    kinds, encode = GROUPS[args.kinds]
+    parts = []
+    # Collect in rounds on fresh simulators: each leaks ~3 MB per episode.
+    rounds = max(1, -(-args.steps // (args.num_envs * args.round_steps)))
+    for r in range(rounds):
+        group = launch_sims(args.num_envs, request_timeout=120)
+        envs = [BattleEnv(i, seed_prefix=f"{args.name}-r{r}", reward=RewardConfig(gamma=args.gamma), sim=sim,
+                          policy_kinds=kinds) for i, sim in enumerate(group.clients)]
+        per_env = args.steps // (args.num_envs * rounds)
+        with ThreadPoolExecutor(args.num_envs) as pool:
+            parts += list(pool.map(lambda e: collect(e, per_env, args.gamma, encode), envs))
+        for e in envs:
+            e.close()
+        group.close()
+        print(f"round {r + 1}/{rounds}: {sum(len(p[0]) for p in parts)} decisions", flush=True)
     feats = [f for part in parts for f in part[0]]
     data = {k: torch.as_tensor(np.stack([f[k] for f in feats]), device=device) for k in feats[0]}
     actions = torch.as_tensor([a for part in parts for a in part[1]], device=device)
     returns = torch.as_tensor([g for part in parts for g in part[2]], device=device, dtype=torch.float32)
-    print(f"collected {len(feats)} battle decisions in {time.time() - t0:.0f}s", flush=True)
+    print(f"collected {len(feats)} {args.kinds} decisions in {time.time() - t0:.0f}s", flush=True)
 
-    policy = BattlePolicy().to(device)
+    agent = AgentPolicy().to(device)
+    policy = getattr(agent, args.kinds)
     optimizer = torch.optim.Adam(policy.parameters(), lr=args.lr)
     n = len(feats)
     split = int(n * 0.9)  # hold out the last 10% (later episodes of each env) for validation
@@ -103,7 +118,7 @@ def main() -> None:
             v_err = (value - returns[split:]).pow(2).mean().item()
         print(f"epoch {epoch + 1}: val action accuracy {acc:.3f}, val value MSE {v_err:.3f}", flush=True)
 
-    torch.save({"policy": policy.state_dict(), "args": vars(args)}, out / "policy.pt")
+    torch.save({"policy": agent.state_dict(), "args": vars(args)}, out / "policy.pt")
     (out / "bc.json").write_text(json.dumps({"decisions": n, "val_accuracy": acc, "val_value_mse": v_err}))
     print(f"saved {out / 'policy.pt'}")
 

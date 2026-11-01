@@ -15,7 +15,7 @@ import torch
 
 from pokerogue_rl import features as F
 from pokerogue_rl.env import BattleEnv, VecBattleEnv
-from pokerogue_rl.policy import BattlePolicy, to_tensors
+from pokerogue_rl.policy import AgentPolicy, encode_step, to_tensors
 
 CPU = torch.device("cpu")
 
@@ -36,8 +36,8 @@ class Rollout:
     sim_errors: int = 0
 
 
-def _act(policy: BattlePolicy, obs: dict) -> tuple[dict, int, float, float]:
-    enc = F.encode(obs)
+def _act(policy: AgentPolicy, obs: dict) -> tuple[dict, int, float, float]:
+    enc = encode_step(obs)
     with torch.no_grad():
         logits, value = policy(to_tensors(F.stack([enc]), CPU))
         dist = torch.distributions.Categorical(logits=logits)
@@ -45,7 +45,7 @@ def _act(policy: BattlePolicy, obs: dict) -> tuple[dict, int, float, float]:
     return enc, int(action), float(dist.log_prob(action)), float(value)
 
 
-def _run_env(env: BattleEnv, policy: BattlePolicy, steps: int) -> dict:
+def _run_env(env: BattleEnv, policy: AgentPolicy, steps: int) -> dict:
     out = {k: [] for k in ("feats", "actions", "logps", "values", "rewards", "dones")}
     episodes, invalid, sim_errors = [], 0, 0
     obs = env.obs
@@ -59,12 +59,12 @@ def _run_env(env: BattleEnv, policy: BattlePolicy, steps: int) -> dict:
         if "episode" in info:
             episodes.append(info["episode"])
     with torch.no_grad():
-        _, next_value = policy(to_tensors(F.stack([F.encode(obs)]), CPU))
+        _, next_value = policy(to_tensors(F.stack([encode_step(obs)]), CPU))
     return {**out, "next_value": float(next_value), "episodes": episodes, "invalid": invalid,
             "sim_errors": sim_errors}
 
 
-def collect(envs: VecBattleEnv, policy: BattlePolicy, steps: int) -> Rollout:
+def collect(envs: VecBattleEnv, policy: AgentPolicy, steps: int) -> Rollout:
     """Collect `steps` policy steps from every env in parallel. `policy` must live on the CPU."""
     parts = list(envs.pool.map(lambda e: _run_env(e, policy, steps), envs.envs))
     feats = {k: np.stack([F.stack(p["feats"])[k] for p in parts], axis=1) for k in parts[0]["feats"][0]}

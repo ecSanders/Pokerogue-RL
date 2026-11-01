@@ -1,7 +1,8 @@
-"""Battle-only RL environment over the simulator.
+"""RL environment over the simulator.
 
-The policy makes battle decisions (command, target, faint_switch). Everything else (rewards,
-item targets, move learning, releases) is played by the heuristic agent in between.
+The policy makes the decisions in `policy_kinds`: by default the battle decisions (command, target,
+faint_switch); add RUN_KINDS for rewards, item targets, move learning and releases. The heuristic
+agent plays every other decision in between.
 
 Reward per policy step:
   + WAVE_REWARD per wave cleared                       (the objective)
@@ -20,6 +21,7 @@ import numpy as np
 
 from pokerogue_rl.agents.heuristic import HeuristicAgent
 from pokerogue_rl.features import BATTLE_KINDS
+from pokerogue_rl.run_features import TmMemory
 from pokerogue_rl.sim_client import SimClient, SimError, launch_sims
 
 
@@ -41,8 +43,11 @@ def enemy_health(obs: dict) -> float:
 
 class BattleEnv:
     def __init__(self, env_id: int, seed_prefix: str = "train", max_wave: int = 500,
-                 reward: RewardConfig | None = None, sim: SimClient | None = None):
+                 reward: RewardConfig | None = None, sim: SimClient | None = None,
+                 policy_kinds: tuple[str, ...] = BATTLE_KINDS):
         """`sim`: a client from a shared simulator group; launches its own simulator if omitted."""
+        self.policy_kinds = tuple(policy_kinds)
+        self.tm_memory = TmMemory()
         self.sim = sim or SimClient.launch(request_timeout=120)
         self.helper = HeuristicAgent()
         self.sim_errors = 0
@@ -53,10 +58,12 @@ class BattleEnv:
         self.episode_return = 0.0
         self.episode_steps = 0
 
-    def _play_until_battle(self, resp: dict) -> dict:
-        """Let the heuristic answer non-battle decisions until the policy has a battle decision."""
-        while not resp["done"] and resp["obs"]["kind"] not in BATTLE_KINDS:
+    def _play_until_policy(self, resp: dict) -> dict:
+        """Let the heuristic answer other decisions until the policy has one of its own."""
+        while not resp["done"] and resp["obs"]["kind"] not in self.policy_kinds:
             resp = self.sim.step(self.helper.act(resp["obs"]))
+        if not resp["done"]:
+            resp = {**resp, "obs": self.tm_memory.filter(resp["obs"])}
         return resp
 
     def _restart_sim(self, error: Exception) -> None:
@@ -77,7 +84,8 @@ class BattleEnv:
 
     def _reset(self) -> dict:
         self.helper.reset()
-        resp = self._play_until_battle(self.sim.reset(seed=next(self.seeds), max_wave=self.max_wave))
+        self.tm_memory.reset()
+        resp = self._play_until_policy(self.sim.reset(seed=next(self.seeds), max_wave=self.max_wave))
         if resp["done"]:  # ended before any battle decision; try another seed
             return self._reset()
         self.obs = resp["obs"]
@@ -88,8 +96,9 @@ class BattleEnv:
     def step(self, action: int) -> tuple[dict, float, bool, dict]:
         prev = self.obs
         self.helper._update_carry(prev["party"])  # the heuristic's item choices follow its carry
+        self.tm_memory.note(prev, int(action))
         try:
-            resp = self._play_until_battle(self.sim.step(int(action)))
+            resp = self._play_until_policy(self.sim.step(int(action)))
         except (SimError, OSError) as e:
             # End the episode with no reward; GAE stops at done, so nothing bootstraps across it.
             self._restart_sim(e)

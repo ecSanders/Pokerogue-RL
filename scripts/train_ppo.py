@@ -3,6 +3,8 @@
 Usage:
   python scripts/train_ppo.py --name ppo-v1 --total-steps 2000000
   python scripts/train_ppo.py --name ppo-bc --init runs/bc/policy.pt   # warm start
+  python scripts/train_ppo.py --name run-v1 --run-policy --init runs/ppo-v5/policy.pt \
+      --run-init runs/bc-run/policy.pt      # the policy also plays rewards, item targets, moves, releases
 
 Writes runs/<name>/log.jsonl (one line per update) and checkpoints runs/<name>/policy.pt.
 """
@@ -21,7 +23,9 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from pokerogue_rl.env import RewardConfig, VecBattleEnv  # noqa: E402
-from pokerogue_rl.policy import BattlePolicy  # noqa: E402
+from pokerogue_rl.features import BATTLE_KINDS  # noqa: E402
+from pokerogue_rl.policy import AgentPolicy  # noqa: E402
+from pokerogue_rl.run_features import RUN_KINDS  # noqa: E402
 from pokerogue_rl.rollout import collect  # noqa: E402
 
 
@@ -42,6 +46,10 @@ def parse_args():
     p.add_argument("--vf-coef", type=float, default=0.5)
     p.add_argument("--max-grad-norm", type=float, default=0.5)
     p.add_argument("--init", help="checkpoint to start from (e.g. behaviour-cloned policy)")
+    p.add_argument("--run-init", help="checkpoint whose run-policy half replaces the --init one (e.g. from "
+                                     "bc_pretrain.py --kinds run)")
+    p.add_argument("--run-policy", action="store_true",
+                   help="the policy also makes run decisions (rewards, item targets, moves, releases)")
     p.add_argument("--resume", action="store_true",
                    help="continue runs/<name>/policy.pt: weights, optimizer, update count and LR schedule")
     p.add_argument("--recycle-every", type=int, default=100,
@@ -59,23 +67,27 @@ def main() -> None:
     out.mkdir(parents=True, exist_ok=True)
     (out / "config.json").write_text(json.dumps(vars(args), indent=2))
 
-    policy = BattlePolicy().to(device)
+    policy = AgentPolicy().to(device)
     optimizer = torch.optim.Adam(policy.parameters(), lr=args.lr, eps=1e-5)
     first_update, global_step = 1, 0
     if args.resume:
-        ckpt = torch.load(out / "policy.pt", map_location=device)
-        policy.load_state_dict(ckpt["policy"])
+        ckpt = policy.load_checkpoint(out / "policy.pt", map_location=device)
         optimizer.load_state_dict(ckpt["optimizer"])
         first_update, global_step = ckpt["update"] + 1, ckpt["step"]
     elif args.init:
-        policy.load_state_dict(torch.load(args.init, map_location=device)["policy"])
+        policy.load_checkpoint(args.init, map_location=device)
+    if args.run_init and not args.resume:
+        run_init = AgentPolicy()
+        run_init.load_checkpoint(args.run_init)
+        policy.run.load_state_dict(run_init.run.state_dict())
 
     # Rollouts run per-env threads with small-batch inference on a CPU copy (faster than GPU there).
-    actor = BattlePolicy()
+    actor = AgentPolicy()
     actor.load_state_dict(policy.state_dict())
 
     envs = VecBattleEnv(args.num_envs, seed_prefix=args.name, max_wave=args.max_wave,
-                        reward=RewardConfig(gamma=args.gamma))
+                        reward=RewardConfig(gamma=args.gamma),
+                        policy_kinds=BATTLE_KINDS + (RUN_KINDS if args.run_policy else ()))
     envs.reset()
     n, t_len = args.num_envs, args.rollout
     batch_size = n * t_len
@@ -111,6 +123,7 @@ def main() -> None:
 
         flat = {k: to_dev(v.reshape(batch_size, *v.shape[2:])) for k, v in rollout.feats.items()}
         b_actions = to_dev(rollout.actions).flatten()
+        run_frac = flat["is_run"].float().mean().item()
         b_logps, b_adv, b_ret = to_dev(rollout.logps).flatten(), advantages.flatten(), returns.flatten()
 
         stats = collections.defaultdict(list)
@@ -136,6 +149,9 @@ def main() -> None:
                 stats["pg_loss"].append(pg_loss.item())
                 stats["v_loss"].append(v_loss.item())
                 stats["entropy"].append(entropy.item())
+                is_run = flat["is_run"][idx]
+                if is_run.any():
+                    stats["run_entropy"].append(dist.entropy()[is_run].mean().item())
                 stats["clipfrac"].append(((ratio - 1).abs() > args.clip).float().mean().item())
 
         actor.load_state_dict({k: v.cpu() for k, v in policy.state_dict().items()})
@@ -150,6 +166,7 @@ def main() -> None:
             "return_mean": round(float(np.mean([e["return"] for e in recent])), 3) if recent else None,
             "invalid": invalid,
             "sim_errors": sim_errors,
+            "run_frac": round(run_frac, 3),
             **{k: round(float(np.mean(v)), 4) for k, v in stats.items()},
         }
         with (out / "log.jsonl").open("a") as f:

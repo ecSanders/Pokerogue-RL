@@ -18,13 +18,16 @@ class RandomAgent:
 
 
 def policy_agent():
-    """Learned battle policy from the checkpoint at $POLICY_CHECKPOINT; heuristic for the rest."""
+    """Learned policy from the checkpoint at $POLICY_CHECKPOINT; heuristic for the rest.
+
+    $POLICY_RUN=1/0 forces whether the policy also plays run decisions (default: as trained)."""
     import torch
 
     from pokerogue_rl.agents.policy_agent import PolicyAgent
 
     torch.set_num_threads(1)  # one agent per eval worker thread
-    return PolicyAgent(os.environ["POLICY_CHECKPOINT"])
+    run = os.environ.get("POLICY_RUN")
+    return PolicyAgent(os.environ["POLICY_CHECKPOINT"], run_policy=None if run is None else run == "1")
 
 
 AGENTS = {
