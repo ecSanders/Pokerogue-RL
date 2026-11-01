@@ -20,9 +20,9 @@ import torch
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from pokerogue_rl import features as F  # noqa: E402
 from pokerogue_rl.env import RewardConfig, VecBattleEnv  # noqa: E402
-from pokerogue_rl.policy import BattlePolicy, to_tensors  # noqa: E402
+from pokerogue_rl.policy import BattlePolicy  # noqa: E402
+from pokerogue_rl.rollout import collect  # noqa: E402
 
 
 def parse_args():
@@ -53,7 +53,7 @@ def parse_args():
 
 def main() -> None:
     args = parse_args()
-    torch.set_num_threads(2)  # leave CPU cores to the simulators
+    torch.set_num_threads(1)  # leave CPU cores to the simulators; rollout threads infer in parallel
     device = torch.device(args.device)
     out = ROOT / "runs" / args.name
     out.mkdir(parents=True, exist_ok=True)
@@ -70,9 +70,13 @@ def main() -> None:
     elif args.init:
         policy.load_state_dict(torch.load(args.init, map_location=device)["policy"])
 
+    # Rollouts run per-env threads with small-batch inference on a CPU copy (faster than GPU there).
+    actor = BattlePolicy()
+    actor.load_state_dict(policy.state_dict())
+
     envs = VecBattleEnv(args.num_envs, seed_prefix=args.name, max_wave=args.max_wave,
                         reward=RewardConfig(gamma=args.gamma))
-    obs = envs.reset()
+    envs.reset()
     n, t_len = args.num_envs, args.rollout
     batch_size = n * t_len
     num_updates = args.total_steps // batch_size
@@ -84,35 +88,17 @@ def main() -> None:
         for g in optimizer.param_groups:
             g["lr"] = args.lr * (1 - (update - 1) / num_updates)
 
-        feats, actions, logps, values, rewards, dones = [], [], [], [], [], []
-        invalid = sim_errors = 0
         rollout_start = time.time()
-        for _ in range(t_len):
-            enc = F.stack([F.encode(o) for o in obs])
-            with torch.no_grad():
-                logits, value = policy(to_tensors(enc, device))
-                dist = torch.distributions.Categorical(logits=logits)
-                action = dist.sample()
-            obs, reward, done, infos = envs.step(action.cpu().numpy())
-            feats.append(enc)
-            actions.append(action)
-            logps.append(dist.log_prob(action))
-            values.append(value)
-            rewards.append(torch.as_tensor(reward, device=device))
-            dones.append(torch.as_tensor(done, device=device, dtype=torch.float32))
-            for info in infos:
-                invalid += info["invalid"]
-                sim_errors += "sim_error" in info
-                if "episode" in info:
-                    recent.append(info["episode"])
+        rollout = collect(envs, actor, t_len)
+        recent.extend(rollout.episodes)
+        invalid, sim_errors = rollout.invalid, rollout.sim_errors
         global_step += batch_size
         rollout_time = time.time() - rollout_start
 
         # GAE. Episodes end inside the rollout (done=1 cuts bootstrapping); bootstrap the tail.
-        with torch.no_grad():
-            _, next_value = policy(to_tensors(F.stack([F.encode(o) for o in obs]), device))
-        values_t = torch.stack(values)
-        rewards_t, dones_t = torch.stack(rewards), torch.stack(dones)
+        to_dev = lambda a: torch.as_tensor(a, device=device)  # noqa: E731
+        values_t, rewards_t, dones_t = to_dev(rollout.values), to_dev(rollout.rewards), to_dev(rollout.dones)
+        next_value = to_dev(rollout.next_values)
         advantages = torch.zeros_like(rewards_t)
         last = torch.zeros(n, device=device)
         for t in reversed(range(t_len)):
@@ -123,9 +109,9 @@ def main() -> None:
             advantages[t] = last
         returns = advantages + values_t
 
-        flat = {k: torch.as_tensor(np.concatenate([f[k] for f in feats]), device=device) for k in feats[0]}
-        b_actions = torch.cat(actions)
-        b_logps, b_adv, b_ret = torch.cat(logps), advantages.flatten(), returns.flatten()
+        flat = {k: to_dev(v.reshape(batch_size, *v.shape[2:])) for k, v in rollout.feats.items()}
+        b_actions = to_dev(rollout.actions).flatten()
+        b_logps, b_adv, b_ret = to_dev(rollout.logps).flatten(), advantages.flatten(), returns.flatten()
 
         stats = collections.defaultdict(list)
         mb_size = batch_size // args.minibatches
@@ -152,6 +138,8 @@ def main() -> None:
                 stats["entropy"].append(entropy.item())
                 stats["clipfrac"].append(((ratio - 1).abs() > args.clip).float().mean().item())
 
+        actor.load_state_dict({k: v.cpu() for k, v in policy.state_dict().items()})
+
         waves = [e["wave"] for e in recent]
         row = {
             "update": update, "step": global_step, "time": round(time.time() - start),
@@ -172,7 +160,7 @@ def main() -> None:
             torch.save({"policy": policy.state_dict(), "optimizer": optimizer.state_dict(), "update": update,
                         "step": global_step, "args": vars(args)}, out / "policy.pt")
         if update % args.recycle_every == 0 and update < num_updates:
-            obs = envs.recycle()
+            envs.recycle()
 
     envs.close()
 
