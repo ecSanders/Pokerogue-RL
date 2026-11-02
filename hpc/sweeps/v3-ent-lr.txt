@@ -1,8 +1,9 @@
 # First sweep after the uid fix to level/carry shaping (catches no longer pay).
 # run-exp-v2 and v3 plateaued at mean wave ~40 (many runs die to the wave-50 boss). Their clipfrac
 # fell to 0 only because the LR decays linearly to 0; at full LR it was ~0.035. This varies the
-# entropy bonus and learning rate, including a constant 5e-4. Most runs start from run-exp-v2; the "bc" runs start from the
-# behaviour-cloned run policy, which never learned to farm catches.
+# entropy bonus and learning rate, including a constant 5e-4, and the boss-readiness reward
+# (--boss-coef). Most runs start from run-exp-v2; the "bc" runs start from the behaviour-cloned
+# run policy, which never learned to farm catches.
 # Each line: NAME train_ppo.py-args. Needs runs/run-exp-v2 and runs/bc-run synced to the cluster.
 # 10M steps is ~4.5 h at the local rate (650 steps/s with 12 envs).
 
@@ -17,3 +18,10 @@ v3-bc-ent01-lr25e4  --init runs/bc-run/v5_plus_bc_run.pt --run-policy --total-st
 # Constant, larger learning rate: clipfrac was only ~0.035 at the start of v2/v3, i.e. small updates.
 v3-ent01-lr5e4c     --init runs/run-exp-v2/policy.pt --run-policy --total-steps 10000000 --max-wave 500 --level-coef 0.1 --carry-coef 0.1 --pokerus-coef 0.3 --double-envs 4 --recycle-every 50 --ent-coef 0.01 --lr 5e-4 --lr-schedule constant
 v3-bc-ent01-lr5e4c  --init runs/bc-run/v5_plus_bc_run.pt --run-policy --total-steps 10000000 --max-wave 500 --level-coef 0.1 --carry-coef 0.1 --pokerus-coef 0.3 --double-envs 4 --recycle-every 50 --ent-coef 0.01 --lr 5e-4 --lr-schedule constant
+# Boss-readiness reward: 72% of v3's runs die to the boss every 10th wave with the carry ~4 levels
+# under it. Arriving at a boss pays boss_coef * clip(carry - boss level, -10, +5). Compare with the
+# local run-exp-v4 (boss 0.15, from run-exp-v3) and with v3-ent01-lr1e4 above (same args, no boss reward).
+v3-boss01           --init runs/run-exp-v2/policy.pt --run-policy --total-steps 10000000 --max-wave 500 --level-coef 0.1 --carry-coef 0.1 --pokerus-coef 0.3 --double-envs 4 --recycle-every 50 --ent-coef 0.01 --lr 1e-4 --boss-coef 0.1
+v3-boss02           --init runs/run-exp-v2/policy.pt --run-policy --total-steps 10000000 --max-wave 500 --level-coef 0.1 --carry-coef 0.1 --pokerus-coef 0.3 --double-envs 4 --recycle-every 50 --ent-coef 0.01 --lr 1e-4 --boss-coef 0.2
+v3-boss03           --init runs/run-exp-v2/policy.pt --run-policy --total-steps 10000000 --max-wave 500 --level-coef 0.1 --carry-coef 0.1 --pokerus-coef 0.3 --double-envs 4 --recycle-every 50 --ent-coef 0.01 --lr 1e-4 --boss-coef 0.3
+v3-bc-boss02        --init runs/bc-run/v5_plus_bc_run.pt --run-policy --total-steps 10000000 --max-wave 500 --level-coef 0.1 --carry-coef 0.1 --pokerus-coef 0.3 --double-envs 4 --recycle-every 50 --ent-coef 0.01 --lr 1e-4 --boss-coef 0.2
