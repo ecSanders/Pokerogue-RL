@@ -8,7 +8,15 @@ Reward per policy step:
   + WAVE_REWARD per wave cleared                       (the objective)
   + TEAM_COEF * (gamma * team_health' - team_health)   (potential-based shaping: wear-down)
   + DAMAGE_COEF * enemy HP fraction removed this wave   (early learning signal)
+  + LEVEL_COEF * (party_levels' - party_levels)       (shaping: EXP now pays off at boss waves later)
+  + CARRY_COEF * (carry_level' - carry_level)         (shaping: one carry takes the EXP and items)
+  + POKERUS_COEF * (pokerus' - pokerus)               (shaping: keep a carrier until all have it)
 team_health = sum of party HP fractions / 6, so fainted members count 0; 0 at game over.
+party_levels = sum of party levels. Without it, catching (no EXP) clears wild waves as well as a KO
+does, and the under-levelled team then dies to the wave-50 boss, beyond the discount horizon.
+Level shaping is undiscounted: the gamma * potential form costs (1 - gamma) * levels every step,
+which grows with the team and would reward ending waves in fewer turns, i.e. catching.
+carry_level = highest party level; pokerus = party members with Pokerus (1.5x EXP, spreads).
 """
 
 from __future__ import annotations
@@ -23,6 +31,7 @@ from pokerogue_rl.agents.heuristic import HeuristicAgent
 from pokerogue_rl.features import BATTLE_KINDS
 from pokerogue_rl.run_features import TmMemory
 from pokerogue_rl.sim_client import SimClient, SimError, launch_sims
+from pokerogue_rl.strategy import StrategyTracker, carry_level, pokerus_count
 
 
 @dataclass
@@ -31,10 +40,17 @@ class RewardConfig:
     wave_reward: float = 1.0
     team_coef: float = 1.0
     damage_coef: float = 0.2
+    level_coef: float = 0.0
+    carry_coef: float = 0.0
+    pokerus_coef: float = 0.0
 
 
 def team_health(obs: dict) -> float:
     return sum(p["hp"] / p["maxHp"] for p in obs["party"] if p["maxHp"]) / 6
+
+
+def party_levels(obs: dict) -> float:
+    return float(sum(p["level"] for p in obs["party"]))
 
 
 def enemy_health(obs: dict) -> float:
@@ -44,10 +60,13 @@ def enemy_health(obs: dict) -> float:
 class BattleEnv:
     def __init__(self, env_id: int, seed_prefix: str = "train", max_wave: int = 500,
                  reward: RewardConfig | None = None, sim: SimClient | None = None,
-                 policy_kinds: tuple[str, ...] = BATTLE_KINDS):
-        """`sim`: a client from a shared simulator group; launches its own simulator if omitted."""
+                 policy_kinds: tuple[str, ...] = BATTLE_KINDS, double_chance: float | None = None):
+        """`sim`: a client from a shared simulator group; launches its own simulator if omitted.
+        `double_chance`: more double battles for practice (see SimClient.reset)."""
+        self.double_chance = double_chance
         self.policy_kinds = tuple(policy_kinds)
         self.tm_memory = TmMemory()
+        self.strategy = StrategyTracker()
         self.sim = sim or SimClient.launch(request_timeout=120)
         self.helper = HeuristicAgent()
         self.sim_errors = 0
@@ -61,7 +80,9 @@ class BattleEnv:
     def _play_until_policy(self, resp: dict) -> dict:
         """Let the heuristic answer other decisions until the policy has one of its own."""
         while not resp["done"] and resp["obs"]["kind"] not in self.policy_kinds:
-            resp = self.sim.step(self.helper.act(resp["obs"]))
+            action = self.helper.act(resp["obs"])
+            self.strategy.note(resp["obs"], action)
+            resp = self.sim.step(action)
         if not resp["done"]:
             resp = {**resp, "obs": self.tm_memory.filter(resp["obs"])}
         return resp
@@ -85,7 +106,9 @@ class BattleEnv:
     def _reset(self) -> dict:
         self.helper.reset()
         self.tm_memory.reset()
-        resp = self._play_until_policy(self.sim.reset(seed=next(self.seeds), max_wave=self.max_wave))
+        self.strategy.reset()
+        resp = self._play_until_policy(self.sim.reset(seed=next(self.seeds), max_wave=self.max_wave,
+                                                         double_chance=self.double_chance))
         if resp["done"]:  # ended before any battle decision; try another seed
             return self._reset()
         self.obs = resp["obs"]
@@ -97,6 +120,7 @@ class BattleEnv:
         prev = self.obs
         self.helper._update_carry(prev["party"])  # the heuristic's item choices follow its carry
         self.tm_memory.note(prev, int(action))
+        self.strategy.note(prev, int(action))
         try:
             resp = self._play_until_policy(self.sim.step(int(action)))
         except (SimError, OSError) as e:
@@ -109,6 +133,12 @@ class BattleEnv:
         reward = cfg.wave_reward * (obs["wave"] - prev["wave"])
         next_health = 0.0 if done and resp["info"]["reason"] == "game_over" else team_health(obs)
         reward += cfg.team_coef * (cfg.gamma * next_health - team_health(prev))
+        if cfg.level_coef:
+            reward += cfg.level_coef * (party_levels(obs) - party_levels(prev))
+        if cfg.carry_coef:
+            reward += cfg.carry_coef * (carry_level(obs["party"]) - carry_level(prev["party"]))
+        if cfg.pokerus_coef:
+            reward += cfg.pokerus_coef * (pokerus_count(obs["party"]) - pokerus_count(prev["party"]))
         if obs["wave"] == prev["wave"]:
             reward += cfg.damage_coef * max(0.0, enemy_health(prev) - enemy_health(obs))
 
@@ -117,7 +147,8 @@ class BattleEnv:
         info = {"invalid": resp["info"].get("invalidAction", False)}
         if done:
             info["episode"] = {"wave": obs["wave"], "reason": resp["info"]["reason"],
-                               "return": self.episode_return, "steps": self.episode_steps}
+                               "return": self.episode_return, "steps": self.episode_steps,
+                               **self.strategy.summary(obs)}
             obs = self.reset()
         else:
             self.obs = obs
@@ -130,9 +161,11 @@ class BattleEnv:
 class VecBattleEnv:
     """N BattleEnvs on one shared simulator process, stepped in parallel threads."""
 
-    def __init__(self, num_envs: int, **kwargs):
+    def __init__(self, num_envs: int, double_envs: int = 0, double_chance: float | None = None, **kwargs):
+        """The first `double_envs` envs play with `double_chance` (a doubles curriculum)."""
         self.group = launch_sims(num_envs, request_timeout=120)
-        self.envs = [BattleEnv(i, sim=client, **kwargs) for i, client in enumerate(self.group.clients)]
+        self.envs = [BattleEnv(i, sim=client, double_chance=double_chance if i < double_envs else None, **kwargs)
+                     for i, client in enumerate(self.group.clients)]
         self.pool = ThreadPoolExecutor(num_envs)
 
     def reset(self) -> list[dict]:

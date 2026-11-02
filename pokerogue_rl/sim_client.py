@@ -119,8 +119,12 @@ class SimClient:
         return resp
 
     def reset(self, seed: str | None = None, mode: str = "endless",
-              starters: list[str] | None = None, max_wave: int | None = None) -> dict:
+              starters: list[str] | None = None, max_wave: int | None = None,
+              double_chance: float | None = None) -> dict:
+        """`double_chance`: training curriculum, see ResetOpts.doubleChance in sim/sim-server.ts."""
         msg = {"cmd": "reset", "mode": mode}
+        if double_chance is not None:
+            msg["doubleChance"] = double_chance
         if seed is not None:
             msg["seed"] = seed
         if starters is not None:

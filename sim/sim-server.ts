@@ -163,6 +163,12 @@ interface ResetOpts {
   nature?: Nature;
   /** Indices of starters that start with Pokerus (1.5x EXP, spreads to party neighbours); default [0]. */
   pokerus?: number[];
+  /**
+   * Training curriculum: scale the 1-in-N wild double-battle roll by doubleChance / 8 (the base N on
+   * normal waves), e.g. 2 for ~50% doubles instead of ~12%. Lures and abilities still divide it.
+   * Endless boss waves stay single. Default: the real game's chance.
+   */
+  doubleChance?: number;
 }
 
 interface RewardOption {
@@ -230,6 +236,7 @@ class Sim {
     this.manualClock = false; // the test framework's helpers below need the wall-clock interval
     this.game.settings.battleStyle(BattleStyle.SET);
     this.maxWave = opts.maxWave ?? Number.POSITIVE_INFINITY;
+    this.setDoubleChance(opts.doubleChance);
     this.autoInputs = {};
 
     const mode = opts.mode === "classic" ? GameModes.CLASSIC : GameModes.ENDLESS;
@@ -356,6 +363,18 @@ class Sim {
   private baseline?: { field: Set<unknown>; fieldUI: Set<unknown>; events: Set<unknown> };
 
   /** On the first reset, record the scene's structures; on later resets, cut them back to that. */
+  /** See ResetOpts.doubleChance. The scene persists across resets, so set or clear it every reset. */
+  private setDoubleChance(doubleChance?: number) {
+    const scene = this.scene as any;
+    delete scene.getDoubleBattleChance;
+    if (doubleChance) {
+      const real = BattleScene.prototype["getDoubleBattleChance"];
+      scene.getDoubleBattleChance = function (this: BattleScene, waveIndex: number): number {
+        return Math.max(1, Math.round((real.call(this, waveIndex) * doubleChance) / 8));
+      };
+    }
+  }
+
   private restoreBaseline() {
     const scene = this.scene as any;
     if (!this.baseline) {

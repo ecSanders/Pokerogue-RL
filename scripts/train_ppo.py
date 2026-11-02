@@ -38,6 +38,16 @@ def parse_args():
     p.add_argument("--max-wave", type=int, default=500)
     p.add_argument("--lr", type=float, default=2.5e-4)
     p.add_argument("--gamma", type=float, default=0.995)
+    p.add_argument("--level-coef", type=float, default=0.0,
+                   help="reward shaping per party level gained (see env.py)")
+    p.add_argument("--carry-coef", type=float, default=0.0,
+                   help="reward shaping per level gained by the highest-level member")
+    p.add_argument("--pokerus-coef", type=float, default=0.0,
+                   help="reward shaping per party member gaining Pokerus (lost on release)")
+    p.add_argument("--double-envs", type=int, default=0,
+                   help="envs that play with --double-chance, for double-battle practice")
+    p.add_argument("--double-chance", type=float, default=2.0,
+                   help="1-in-N wild double roll on normal waves for --double-envs (real game: 8)")
     p.add_argument("--gae-lambda", type=float, default=0.95)
     p.add_argument("--epochs", type=int, default=4)
     p.add_argument("--minibatches", type=int, default=4)
@@ -85,8 +95,10 @@ def main() -> None:
     actor = AgentPolicy()
     actor.load_state_dict(policy.state_dict())
 
-    envs = VecBattleEnv(args.num_envs, seed_prefix=args.name, max_wave=args.max_wave,
-                        reward=RewardConfig(gamma=args.gamma),
+    envs = VecBattleEnv(args.num_envs, double_envs=args.double_envs, double_chance=args.double_chance,
+                        seed_prefix=args.name, max_wave=args.max_wave,
+                        reward=RewardConfig(gamma=args.gamma, level_coef=args.level_coef, carry_coef=args.carry_coef,
+                                            pokerus_coef=args.pokerus_coef),
                         policy_kinds=BATTLE_KINDS + (RUN_KINDS if args.run_policy else ()))
     envs.reset()
     n, t_len = args.num_envs, args.rollout
@@ -164,6 +176,9 @@ def main() -> None:
             "wave_mean": round(float(np.mean(waves)), 2) if waves else None,
             "wave_median": float(np.median(waves)) if waves else None,
             "return_mean": round(float(np.mean([e["return"] for e in recent])), 3) if recent else None,
+            # Strategy measures over recent episodes (see pokerogue_rl/strategy.py).
+            **{k: round(float(np.mean([e[k] for e in recent])), 3) if recent else None
+               for k in ("double_frac", "pickup_frac", "lures", "ball_frac", "carry_gap", "pokerus")},
             "invalid": invalid,
             "sim_errors": sim_errors,
             "run_frac": round(run_frac, 3),

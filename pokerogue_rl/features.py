@@ -2,6 +2,7 @@
 
 Layout (all float32 unless noted):
   species  int64 [8]          6 party slots, then 2 enemy slots (0 = empty)
+  ability  int64 [8]          ability id per slot (e.g. Pickup)
   moves    int64 [8, 4]       move ids per slot (0 = empty)
   mon      float [8, MON_DIM] per-Pokemon numeric features
   move     float [8, 4, MOVE_DIM]
@@ -21,6 +22,7 @@ SLOTS = PARTY_SLOTS + ENEMY_SLOTS
 MOVES = 4
 NUM_SPECIES = 9000  # SpeciesId values go up to ~8901 (regional forms use high ranges)
 NUM_MOVES = 1024
+NUM_ABILITIES = 512  # AbilityId has ~320 values
 NUM_TYPES = 20  # NORMAL..FAIRY plus STELLAR
 NUM_STATUS = 8
 NUM_STAT_STAGES = 7
@@ -34,6 +36,10 @@ NUM_ACTIONS = 15
 MON_DIM = 1 + 1 + 1 + 1 + 6 + NUM_STAT_STAGES + NUM_STATUS + NUM_TYPES + 7
 MOVE_DIM = NUM_TYPES + 3 + 5 + 2 * ENEMY_SLOTS * 2
 GLOBAL_DIM = len(BATTLE_KINDS) + 2 + 6 + NUM_BALLS * 2 + MOVE_DIM + MOVES
+
+
+def ability_index(p: dict) -> int:
+    return min(max(p.get("ability", 0), 0), NUM_ABILITIES - 1)
 
 
 def _one_hot(index: int, size: int) -> np.ndarray:
@@ -99,6 +105,7 @@ def _mon_features(p: dict) -> np.ndarray:
 
 def encode(obs: dict) -> dict[str, np.ndarray]:
     species = np.zeros(SLOTS, np.int64)
+    ability = np.zeros(SLOTS, np.int64)
     moves = np.zeros((SLOTS, MOVES), np.int64)
     mon = np.zeros((SLOTS, MON_DIM), np.float32)
     move = np.zeros((SLOTS, MOVES, MOVE_DIM), np.float32)
@@ -109,6 +116,7 @@ def encode(obs: dict) -> dict[str, np.ndarray]:
         if p is None:
             continue
         species[s] = min(p["species"], NUM_SPECIES - 1)
+        ability[s] = ability_index(p)
         mon[s] = _mon_features(p)
         for j, m in enumerate(p["moves"][:MOVES]):
             moves[s, j] = min(m["id"], NUM_MOVES - 1)
@@ -145,7 +153,7 @@ def encode(obs: dict) -> dict[str, np.ndarray]:
     mask = np.zeros(NUM_ACTIONS, bool)
     legal = obs["legal"][:NUM_ACTIONS]
     mask[: len(legal)] = legal
-    return {"species": species, "moves": moves, "mon": mon, "move": move, "glob": glob, "mask": mask}
+    return {"species": species, "ability": ability, "moves": moves, "mon": mon, "move": move, "glob": glob, "mask": mask}
 
 
 def stack(batch: list[dict[str, np.ndarray]]) -> dict[str, np.ndarray]:

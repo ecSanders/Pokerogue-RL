@@ -19,6 +19,7 @@ sys.path.insert(0, str(ROOT))
 
 from pokerogue_rl.agents import AGENTS  # noqa: E402
 from pokerogue_rl.sim_client import SimClient, launch_sims  # noqa: E402
+from pokerogue_rl.strategy import StrategyTracker  # noqa: E402
 
 
 def team_summary(party: list[dict]) -> dict:
@@ -42,6 +43,7 @@ def enemy_summary(enemies: list[dict]) -> list[dict]:
 def play(sim: SimClient, agent, seed: str, max_wave: int) -> dict:
     resp = sim.reset(seed=seed, max_wave=max_wave)
     agent.reset()
+    strategy = StrategyTracker()
     wave_start: dict = {}
     level_gap: dict[int, float] = {}  # wave -> enemy max level - team max level
     last_command = None
@@ -57,7 +59,9 @@ def play(sim: SimClient, agent, seed: str, max_wave: int) -> dict:
             if obs["wave"] not in level_gap and obs["enemies"]:
                 level_gap[obs["wave"]] = (max(e["level"] for e in obs["enemies"])
                                           - max(p["level"] for p in obs["party"]))
-        resp = sim.step(agent.act(obs))
+        action = agent.act(obs)
+        strategy.note(obs, action)
+        resp = sim.step(action)
 
     final = resp["obs"]
     lc = last_command or final
@@ -74,6 +78,7 @@ def play(sim: SimClient, agent, seed: str, max_wave: int) -> dict:
         "level_gap": level_gap,
         "money": final["money"],
         "auto_inputs": resp["info"]["autoInputs"],
+        "strategy": strategy.summary(final),
     }
 
 
@@ -133,6 +138,21 @@ def summarize(records: list[dict]) -> None:
           f"level spread (max-min) median {statistics.median(max(s['levels']) - min(s['levels']) for s in starts)}")
     print(f"  Pokerus carriers: {dict(sorted(Counter(s['pokerus'] for s in starts).items()))}")
     print(f"  shinies: {dict(sorted(Counter(s['shiny'] for s in starts).items()))}")
+
+    print("\nstrategy (per run; see pokerogue_rl/strategy.py):")
+    strat = [r["strategy"] for r in records if r.get("strategy")]
+    med = lambda k: statistics.median(s[k] for s in strat)  # noqa: E731
+    print(f"  waves fought as doubles: median {med('double_frac'):.2f}; lures taken: median {med('lures')}, "
+          f"runs with any {pct(sum(s['lures'] > 0 for s in strat), len(strat))}")
+    print(f"  ball throws per command: median {med('ball_frac'):.2f}")
+    print(f"  carry level at the end: median {med('carry_level')}, "
+          f"carry minus team average: median {med('carry_gap'):+.1f}")
+    print(f"  Pickup user in the team: median {med('pickup_frac'):.2f} of waves, "
+          f"runs with one at some point {pct(sum(s['pickup_frac'] > 0 for s in strat), len(strat))}")
+    full = [s["full_pokerus_wave"] for s in strat if s["full_pokerus_wave"] is not None]
+    print(f"  Pokerus at the end: {dict(sorted(Counter(s['pokerus'] for s in strat).items()))}; "
+          f"whole team infected in {pct(len(full), len(strat))}"
+          + (f", by wave {statistics.median(full)} (median)" if full else ""))
 
     print("\nlevel gap (enemy max level - our max level) by wave decade, all runs:")
     gaps = defaultdict(list)

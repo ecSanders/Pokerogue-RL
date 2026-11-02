@@ -9,6 +9,7 @@ length share one network:
 
 Layout:
   species     int64 [7]                   6 party slots, then the caught Pokemon (0 = empty)
+  ability     int64 [7]                   ability id per slot (e.g. Pickup)
   moves       int64 [7, 4]
   mon         float [7, MON_DIM]
   move        float [7, 4, MOVE_DIM]
@@ -58,6 +59,7 @@ def encode(obs: dict) -> dict[str, np.ndarray]:
     kind = obs["kind"]
     party = obs["party"][: F.PARTY_SLOTS]
     species = np.zeros(MON_SLOTS, np.int64)
+    ability = np.zeros(MON_SLOTS, np.int64)
     moves = np.zeros((MON_SLOTS, F.MOVES), np.int64)
     mon = np.zeros((MON_SLOTS, F.MON_DIM), np.float32)
     move = np.zeros((MON_SLOTS, F.MOVES, F.MOVE_DIM), np.float32)
@@ -66,6 +68,7 @@ def encode(obs: dict) -> dict[str, np.ndarray]:
         if p is None:
             continue
         species[s] = min(p["species"], F.NUM_SPECIES - 1)
+        ability[s] = F.ability_index(p)
         mon[s] = F._mon_features(p)
         for j, m in enumerate(p["moves"][: F.MOVES]):
             moves[s, j] = min(m["id"], F.NUM_MOVES - 1)
@@ -154,7 +157,7 @@ def encode(obs: dict) -> dict[str, np.ndarray]:
 
     mask = np.zeros(MAX_CANDS, bool)
     mask[: len(legal)] = legal
-    return {"species": species, "moves": moves, "mon": mon, "move": move, "glob": glob,
+    return {"species": species, "ability": ability, "moves": moves, "mon": mon, "move": move, "glob": glob,
             "ctx_item": np.int64(ctx_item), "ctx_move_id": np.int64(ctx_move_id), "ctx_move": ctx_move,
             "cand_item": cand_item, "cand_move": cand_move, "cand_slot": cand_slot, "cand": cand,
             "mask": mask}
