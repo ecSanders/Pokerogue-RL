@@ -88,6 +88,11 @@ class BattleEnv:
         self.obs: dict | None = None
         self.episode_return = 0.0
         self.episode_steps = 0
+        # Draining before a recycle (see VecBattleEnv.start_drain): `pending` marks an episode that
+        # must finish first; `tracked` says whether this episode counts in the episode stats.
+        self.pending = False
+        self.tracked = True
+        self.track_new = True
 
     def _play_until_policy(self, resp: dict) -> dict:
         """Let the heuristic answer other decisions until the policy has one of its own."""
@@ -126,6 +131,7 @@ class BattleEnv:
         self.obs = resp["obs"]
         self.episode_return = 0.0
         self.episode_steps = 0
+        self.tracked = self.track_new
         return self.obs
 
     def step(self, action: int) -> tuple[dict, float, bool, dict]:
@@ -138,6 +144,7 @@ class BattleEnv:
         except (SimError, OSError) as e:
             # End the episode with no reward; GAE stops at done, so nothing bootstraps across it.
             self._restart_sim(e)
+            self.pending = False
             return self.reset(), 0.0, True, {"invalid": False, "sim_error": repr(e)}
         obs, done = resp["obs"], resp["done"]
 
@@ -158,9 +165,11 @@ class BattleEnv:
         self.episode_steps += 1
         info = {"invalid": resp["info"].get("invalidAction", False)}
         if done:
-            info["episode"] = {"wave": obs["wave"], "reason": resp["info"]["reason"],
-                               "return": self.episode_return, "steps": self.episode_steps,
-                               **self.strategy.summary(obs)}
+            if self.tracked:
+                info["episode"] = {"wave": obs["wave"], "reason": resp["info"]["reason"],
+                                   "return": self.episode_return, "steps": self.episode_steps,
+                                   **self.strategy.summary(obs)}
+            self.pending = False
             obs = self.reset()
         else:
             self.obs = obs
@@ -179,6 +188,7 @@ class VecBattleEnv:
         self.envs = [BattleEnv(i, sim=client, double_chance=double_chance if i < double_envs else None, **kwargs)
                      for i, client in enumerate(self.group.clients)]
         self.pool = ThreadPoolExecutor(num_envs)
+        self.draining = False
 
     def reset(self) -> list[dict]:
         return list(self.pool.map(lambda e: e.reset(), self.envs))
@@ -188,17 +198,42 @@ class VecBattleEnv:
         obs, rewards, dones, infos = zip(*results)
         return list(obs), np.array(rewards, np.float32), np.array(dones, bool), list(infos)
 
-    def recycle(self) -> list[dict]:
+    def start_drain(self) -> None:
+        """Prepare to recycle without cutting episodes short.
+
+        Recycling mid-episode drops the in-progress episodes, and long episodes are the likeliest to
+        be in progress, so the stats would be biased low and late waves rarely played. Instead, every
+        current episode is marked pending and plays on; envs that finish early start new episodes,
+        which still train but are left out of the stats (those that finish before the recycle would
+        be the short ones). Recycle once `drained`.
+        """
+        self.draining = True
+        for env in self.envs:
+            env.pending = True
+            env.track_new = False
+
+    @property
+    def drained(self) -> bool:
+        return not any(env.pending for env in self.envs)
+
+    def recycle(self) -> int:
         """Restart all simulators (a slow per-episode leak remains) and start fresh episodes.
 
-        Call between rollouts: in-progress episodes are dropped, not reported as finished.
+        Call between rollouts, ideally once `drained`. Returns how many tracked episodes were cut
+        short (dropped, not reported as finished).
         """
+        cut = sum(env.pending and env.tracked for env in self.envs)
+        for env in self.envs:
+            env.pending = False
+            env.track_new = True
+        self.draining = False
         list(self.pool.map(lambda e: e.close(), self.envs))
         self.group.close()
         self.group = launch_sims(len(self.envs), request_timeout=120)
         for env, client in zip(self.envs, self.group.clients):
             env.sim = client
-        return self.reset()
+        self.reset()
+        return cut
 
     def close(self) -> None:
         list(self.pool.map(lambda e: e.close(), self.envs))

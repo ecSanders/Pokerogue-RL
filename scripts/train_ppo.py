@@ -37,6 +37,8 @@ def parse_args():
     p.add_argument("--total-steps", type=int, default=1_000_000)
     p.add_argument("--max-wave", type=int, default=500)
     p.add_argument("--lr", type=float, default=2.5e-4)
+    p.add_argument("--lr-schedule", choices=["linear", "constant"], default="linear",
+                   help="linear: decay to 0 over --total-steps; constant: keep --lr")
     p.add_argument("--gamma", type=float, default=0.995)
     p.add_argument("--level-coef", type=float, default=0.0,
                    help="reward shaping per party level gained (see env.py)")
@@ -64,6 +66,8 @@ def parse_args():
                    help="continue runs/<name>/policy.pt: weights, optimizer, update count and LR schedule")
     p.add_argument("--recycle-every", type=int, default=100,
                    help="updates between simulator restarts (bounds a slow per-episode memory leak)")
+    p.add_argument("--recycle-max-wait", type=int, default=50,
+                   help="updates to wait for in-progress episodes to finish before a restart cuts them")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--save-every", type=int, default=10, help="updates between checkpoints")
     return p.parse_args()
@@ -113,9 +117,8 @@ def main() -> None:
     start = time.time()
 
     for update in range(first_update, num_updates + 1):
-        # Linear learning-rate decay.
         for g in optimizer.param_groups:
-            g["lr"] = args.lr * (1 - (update - 1) / num_updates)
+            g["lr"] = args.lr * (1 - (update - 1) / num_updates) if args.lr_schedule == "linear" else args.lr
 
         rollout_start = time.time()
         rollout = collect(envs, actor, t_len)
@@ -176,7 +179,7 @@ def main() -> None:
         waves = [e["wave"] for e in recent]
         row = {
             "update": update, "step": global_step, "time": round(time.time() - start),
-            "sps": round(batch_size / rollout_time),
+            "sps": round(batch_size / rollout_time), "lr": optimizer.param_groups[0]["lr"],
             "episodes": len(recent),
             "wave_mean": round(float(np.mean(waves)), 2) if waves else None,
             "wave_median": float(np.median(waves)) if waves else None,
@@ -198,8 +201,13 @@ def main() -> None:
             torch.save({"policy": policy.state_dict(), "optimizer": optimizer.state_dict(), "update": update,
                         "step": global_step, "args": vars(args)}, out / "policy.pt.tmp")
             (out / "policy.pt.tmp").replace(out / "policy.pt")
-        if update % args.recycle_every == 0 and update < num_updates:
-            envs.recycle()
+        if update % args.recycle_every == 0 and update < num_updates and not envs.draining:
+            envs.start_drain()
+            drain_start = update
+        if envs.draining and update < num_updates and (envs.drained or update - drain_start >= args.recycle_max_wait):
+            cut = envs.recycle()
+            print(f"recycled simulators after waiting {update - drain_start} updates"
+                  + (f"; cut {cut} unfinished episodes" if cut else ""), flush=True)
 
     envs.close()
 
