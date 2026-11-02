@@ -44,6 +44,9 @@ def parse_args():
                    help="reward shaping per party level gained (see env.py)")
     p.add_argument("--carry-coef", type=float, default=0.0,
                    help="reward shaping per level gained by the highest-level member")
+    p.add_argument("--boss-coef", type=float, default=0.0,
+                   help="reward per level the carry is above a boss wave's expected boss level on arrival "
+                        "(clipped to -10..+5 levels)")
     p.add_argument("--pokerus-coef", type=float, default=0.0,
                    help="reward shaping per party member gaining Pokerus (lost on release)")
     p.add_argument("--double-envs", type=int, default=0,
@@ -107,7 +110,7 @@ def main() -> None:
     envs = VecBattleEnv(args.num_envs, double_envs=args.double_envs, double_chance=args.double_chance,
                         seed_prefix=args.name, max_wave=args.max_wave,
                         reward=RewardConfig(gamma=args.gamma, level_coef=args.level_coef, carry_coef=args.carry_coef,
-                                            pokerus_coef=args.pokerus_coef),
+                                            pokerus_coef=args.pokerus_coef, boss_coef=args.boss_coef),
                         policy_kinds=BATTLE_KINDS + (RUN_KINDS if args.run_policy else ()))
     envs.reset()
     n, t_len = args.num_envs, args.rollout
@@ -187,6 +190,8 @@ def main() -> None:
             # Strategy measures over recent episodes (see pokerogue_rl/strategy.py).
             **{k: round(float(np.mean([e[k] for e in recent])), 3) if recent else None
                for k in ("double_frac", "pickup_frac", "lures", "ball_frac", "carry_gap", "pokerus")},
+            "boss_gap": round(float(np.mean(g)), 2) if (g := [e["boss_gap"] for e in recent
+                                                              if e.get("boss_gap") is not None]) else None,
             "invalid": invalid,
             "sim_errors": sim_errors,
             "run_frac": round(run_frac, 3),

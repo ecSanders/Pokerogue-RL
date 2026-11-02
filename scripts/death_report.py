@@ -147,6 +147,10 @@ def summarize(records: list[dict]) -> None:
     print(f"  ball throws per command: median {med('ball_frac'):.2f}")
     print(f"  carry level at the end: median {med('carry_level')}, "
           f"carry minus team average: median {med('carry_gap'):+.1f}")
+    gaps = [s["boss_gap"] for s in strat if s.get("boss_gap") is not None]
+    if gaps:
+        print(f"  carry minus expected boss level, arriving at the last boss reached: "
+              f"median {statistics.median(gaps):+.1f} ({len(gaps)} runs reached a boss)")
     print(f"  Pickup user in the team: median {med('pickup_frac'):.2f} of waves, "
           f"runs with one at some point {pct(sum(s['pickup_frac'] > 0 for s in strat), len(strat))}")
     full = [s["full_pokerus_wave"] for s in strat if s["full_pokerus_wave"] is not None]
