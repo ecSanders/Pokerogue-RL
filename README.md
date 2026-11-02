@@ -44,6 +44,8 @@ Training logs one JSON line per update to `runs/<name>/log.jsonl`. The reward is
 cleared, plus potential-based team-health shaping and a small bonus for damage dealt (see
 `pokerogue_rl/env.py`).
 
+Training on a Slurm cluster (sweeps, more seeds) is covered in [`hpc/README.md`](hpc/README.md).
+
 ## Decisions
 
 Each observation has a `kind` and a `legal` mask over that kind's actions:

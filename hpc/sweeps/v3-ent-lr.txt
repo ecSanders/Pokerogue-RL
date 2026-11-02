@@ -1,0 +1,15 @@
+# First sweep after the uid fix to level/carry shaping (catches no longer pay).
+# run-exp-v2 plateaued at wave ~40 with entropy ~0.17 and clipfrac 0, so this varies the entropy
+# bonus and learning rate. Most runs start from run-exp-v2; the "bc" runs start from the
+# behaviour-cloned run policy, which never learned to farm catches.
+# Each line: NAME train_ppo.py-args. Needs runs/run-exp-v2 and runs/bc-run synced to the cluster.
+# 10M steps is ~4.5 h at the local rate (650 steps/s with 12 envs).
+
+v3-ent005-lr1e4     --init runs/run-exp-v2/policy.pt --run-policy --total-steps 10000000 --max-wave 500 --level-coef 0.1 --carry-coef 0.1 --pokerus-coef 0.3 --double-envs 4 --recycle-every 50 --ent-coef 0.005 --lr 1e-4
+v3-ent01-lr1e4      --init runs/run-exp-v2/policy.pt --run-policy --total-steps 10000000 --max-wave 500 --level-coef 0.1 --carry-coef 0.1 --pokerus-coef 0.3 --double-envs 4 --recycle-every 50 --ent-coef 0.01 --lr 1e-4
+v3-ent02-lr1e4      --init runs/run-exp-v2/policy.pt --run-policy --total-steps 10000000 --max-wave 500 --level-coef 0.1 --carry-coef 0.1 --pokerus-coef 0.3 --double-envs 4 --recycle-every 50 --ent-coef 0.02 --lr 1e-4
+v3-ent005-lr25e4    --init runs/run-exp-v2/policy.pt --run-policy --total-steps 10000000 --max-wave 500 --level-coef 0.1 --carry-coef 0.1 --pokerus-coef 0.3 --double-envs 4 --recycle-every 50 --ent-coef 0.005 --lr 2.5e-4
+v3-ent01-lr25e4     --init runs/run-exp-v2/policy.pt --run-policy --total-steps 10000000 --max-wave 500 --level-coef 0.1 --carry-coef 0.1 --pokerus-coef 0.3 --double-envs 4 --recycle-every 50 --ent-coef 0.01 --lr 2.5e-4
+v3-ent02-lr25e4     --init runs/run-exp-v2/policy.pt --run-policy --total-steps 10000000 --max-wave 500 --level-coef 0.1 --carry-coef 0.1 --pokerus-coef 0.3 --double-envs 4 --recycle-every 50 --ent-coef 0.02 --lr 2.5e-4
+v3-bc-ent01-lr1e4   --init runs/bc-run/v5_plus_bc_run.pt --run-policy --total-steps 10000000 --max-wave 500 --level-coef 0.1 --carry-coef 0.1 --pokerus-coef 0.3 --double-envs 4 --recycle-every 50 --ent-coef 0.01 --lr 1e-4
+v3-bc-ent01-lr25e4  --init runs/bc-run/v5_plus_bc_run.pt --run-policy --total-steps 10000000 --max-wave 500 --level-coef 0.1 --carry-coef 0.1 --pokerus-coef 0.3 --double-envs 4 --recycle-every 50 --ent-coef 0.01 --lr 2.5e-4

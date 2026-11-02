@@ -84,6 +84,11 @@ def main() -> None:
         ckpt = policy.load_checkpoint(out / "policy.pt", map_location=device)
         optimizer.load_state_dict(ckpt["optimizer"])
         first_update, global_step = ckpt["update"] + 1, ckpt["step"]
+        # Drop log rows written after the checkpoint; those updates are redone.
+        log = out / "log.jsonl"
+        if log.exists():
+            rows = [r for r in log.read_text().splitlines() if json.loads(r)["update"] <= ckpt["update"]]
+            log.write_text("".join(r + "\n" for r in rows))
     elif args.init:
         policy.load_checkpoint(args.init, map_location=device)
     if args.run_init and not args.resume:
@@ -189,8 +194,10 @@ def main() -> None:
         print(" ".join(f"{k}={v}" for k, v in row.items()), flush=True)
 
         if update % args.save_every == 0 or update == num_updates:
+            # Write then rename, so a job killed mid-save (e.g. Slurm preemption) keeps the last good checkpoint.
             torch.save({"policy": policy.state_dict(), "optimizer": optimizer.state_dict(), "update": update,
-                        "step": global_step, "args": vars(args)}, out / "policy.pt")
+                        "step": global_step, "args": vars(args)}, out / "policy.pt.tmp")
+            (out / "policy.pt.tmp").replace(out / "policy.pt")
         if update % args.recycle_every == 0 and update < num_updates:
             envs.recycle()
 

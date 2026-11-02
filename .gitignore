@@ -11,3 +11,4 @@ logs/
 
 # Local Claude Code settings
 .claude/settings.local.json
+hpc/config.sh
