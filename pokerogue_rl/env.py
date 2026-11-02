@@ -8,15 +8,18 @@ Reward per policy step:
   + WAVE_REWARD per wave cleared                       (the objective)
   + TEAM_COEF * (gamma * team_health' - team_health)   (potential-based shaping: wear-down)
   + DAMAGE_COEF * enemy HP fraction removed this wave   (early learning signal)
-  + LEVEL_COEF * (party_levels' - party_levels)       (shaping: EXP now pays off at boss waves later)
-  + CARRY_COEF * (carry_level' - carry_level)         (shaping: one carry takes the EXP and items)
+  + LEVEL_COEF * levels gained by kept Pokemon         (shaping: EXP now pays off at boss waves later)
+  + CARRY_COEF * change in kept carry level            (shaping: one carry takes the EXP and items)
   + POKERUS_COEF * (pokerus' - pokerus)               (shaping: keep a carrier until all have it)
 team_health = sum of party HP fractions / 6, so fainted members count 0; 0 at game over.
-party_levels = sum of party levels. Without it, catching (no EXP) clears wild waves as well as a KO
-does, and the under-levelled team then dies to the wave-50 boss, beyond the discount horizon.
+Level shaping rewards EXP: without it, catching (no EXP) clears wild waves as well as a KO does, and
+the under-levelled team then dies to the wave-50 boss, beyond the discount horizon. Both level terms
+count only Pokemon on the team before and after the step (matched by uid), so a catch or a release
+never pays: summing party levels paid +0.1 * level for every catch, and the policy learned to catch
+nearly every wild wave and churn its bench.
 Level shaping is undiscounted: the gamma * potential form costs (1 - gamma) * levels every step,
 which grows with the team and would reward ending waves in fewer turns, i.e. catching.
-carry_level = highest party level; pokerus = party members with Pokerus (1.5x EXP, spreads).
+carry: highest level among those Pokemon (releasing the carry costs its level); pokerus = party members with Pokerus (1.5x EXP, spreads).
 """
 
 from __future__ import annotations
@@ -49,8 +52,17 @@ def team_health(obs: dict) -> float:
     return sum(p["hp"] / p["maxHp"] for p in obs["party"] if p["maxHp"]) / 6
 
 
-def party_levels(obs: dict) -> float:
-    return float(sum(p["level"] for p in obs["party"]))
+def exp_levels(prev: list[dict], nxt: list[dict]) -> float:
+    """Levels gained by Pokemon on the team both before and after."""
+    before = {p["uid"]: p["level"] for p in prev}
+    return float(sum(max(0, p["level"] - before[p["uid"]]) for p in nxt if p["uid"] in before))
+
+
+def carry_gain(prev: list[dict], nxt: list[dict]) -> float:
+    """Change in the highest level, counting only Pokemon already on the team."""
+    before = {p["uid"] for p in prev}
+    kept = [p["level"] for p in nxt if p["uid"] in before]
+    return float(max(kept, default=0) - carry_level(prev))
 
 
 def enemy_health(obs: dict) -> float:
@@ -134,9 +146,9 @@ class BattleEnv:
         next_health = 0.0 if done and resp["info"]["reason"] == "game_over" else team_health(obs)
         reward += cfg.team_coef * (cfg.gamma * next_health - team_health(prev))
         if cfg.level_coef:
-            reward += cfg.level_coef * (party_levels(obs) - party_levels(prev))
+            reward += cfg.level_coef * exp_levels(prev["party"], obs["party"])
         if cfg.carry_coef:
-            reward += cfg.carry_coef * (carry_level(obs["party"]) - carry_level(prev["party"]))
+            reward += cfg.carry_coef * carry_gain(prev["party"], obs["party"])
         if cfg.pokerus_coef:
             reward += cfg.pokerus_coef * (pokerus_count(obs["party"]) - pokerus_count(prev["party"]))
         if obs["wave"] == prev["wave"]:

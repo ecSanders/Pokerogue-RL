@@ -1014,6 +1014,7 @@ class Sim {
   private encodePokemon(p: Pokemon, withDamage: boolean) {
     const enemies = withDamage ? this.scene.getEnemyField() : [];
     return {
+      uid: p.id,
       species: p.species.speciesId,
       bst: p.species.baseTotal,
       catchRate: p.species.catchRate,
