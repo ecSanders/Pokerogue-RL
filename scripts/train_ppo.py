@@ -47,6 +47,8 @@ def parse_args():
     p.add_argument("--boss-coef", type=float, default=0.0,
                    help="reward per level the carry is above a boss wave's expected boss level on arrival "
                         "(clipped to -10..+5 levels)")
+    p.add_argument("--ball-cost", type=float, default=0.0,
+                   help="reward cost per ball thrown with a full party (catches there earn no EXP)")
     p.add_argument("--pokerus-coef", type=float, default=0.0,
                    help="reward shaping per party member gaining Pokerus (lost on release)")
     p.add_argument("--double-envs", type=int, default=0,
@@ -110,7 +112,8 @@ def main() -> None:
     envs = VecBattleEnv(args.num_envs, double_envs=args.double_envs, double_chance=args.double_chance,
                         seed_prefix=args.name, max_wave=args.max_wave,
                         reward=RewardConfig(gamma=args.gamma, level_coef=args.level_coef, carry_coef=args.carry_coef,
-                                            pokerus_coef=args.pokerus_coef, boss_coef=args.boss_coef),
+                                            pokerus_coef=args.pokerus_coef, boss_coef=args.boss_coef,
+                                            ball_cost=args.ball_cost),
                         policy_kinds=BATTLE_KINDS + (RUN_KINDS if args.run_policy else ()))
     envs.reset()
     n, t_len = args.num_envs, args.rollout

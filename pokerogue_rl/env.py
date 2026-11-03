@@ -12,6 +12,7 @@ Reward per policy step:
   + CARRY_COEF * change in kept carry level            (shaping: one carry takes the EXP and items)
   + POKERUS_COEF * (pokerus' - pokerus)               (shaping: keep a carrier until all have it)
   + BOSS_COEF * clip(carry - boss level, -10, +5)      (on arriving at a boss wave: be ready for it)
+  - BALL_COST per ball thrown with a full party         (catching clears a wave with no EXP)
 team_health = sum of party HP fractions / 6, so fainted members count 0; 0 at game over.
 Level shaping rewards EXP: without it, catching (no EXP) clears wild waves as well as a KO does, and
 the under-levelled team then dies to the wave-50 boss, beyond the discount horizon. Both level terms
@@ -25,6 +26,10 @@ Boss readiness: every 10th wave is a boss, and most runs end there with a health
 under-levelled (the carry ~4 levels below the boss). On arriving at a boss wave, the carry's level is
 compared with the boss's expected level (strategy.boss_level): below it costs up to 10 * BOSS_COEF,
 above it pays up to 5 * BOSS_COEF, so a carry kept ahead of the curve pays at every boss.
+Ball cost: a catch clears a wave for the same WAVE_REWARD as a KO and costs no team health, but earns
+no EXP. With a full party the catch is then released or let go, so v4 threw a ball on 67% of its
+full-party commands and reached bosses under-levelled. Throws with room in the party stay free.
+Ordinary balls are also illegal against bosses (features.restrict_boss_balls).
 """
 
 from __future__ import annotations
@@ -36,7 +41,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from pokerogue_rl.agents.heuristic import HeuristicAgent
-from pokerogue_rl.features import BATTLE_KINDS
+from pokerogue_rl.features import BALL_ACTION, BATTLE_KINDS, restrict_boss_balls
 from pokerogue_rl.run_features import TmMemory
 from pokerogue_rl.sim_client import SimClient, SimError, launch_sims
 from pokerogue_rl.strategy import StrategyTracker, boss_gap, carry_level, pokerus_count
@@ -52,6 +57,7 @@ class RewardConfig:
     carry_coef: float = 0.0
     pokerus_coef: float = 0.0
     boss_coef: float = 0.0
+    ball_cost: float = 0.0
 
 
 def team_health(obs: dict) -> float:
@@ -107,7 +113,7 @@ class BattleEnv:
             self.strategy.note(resp["obs"], action)
             resp = self.sim.step(action)
         if not resp["done"]:
-            resp = {**resp, "obs": self.tm_memory.filter(resp["obs"])}
+            resp = {**resp, "obs": restrict_boss_balls(self.tm_memory.filter(resp["obs"]))}
         return resp
 
     def _restart_sim(self, error: Exception) -> None:
@@ -164,6 +170,8 @@ class BattleEnv:
             reward += cfg.carry_coef * carry_gain(prev["party"], obs["party"])
         if cfg.pokerus_coef:
             reward += cfg.pokerus_coef * (pokerus_count(obs["party"]) - pokerus_count(prev["party"]))
+        if cfg.ball_cost and prev["kind"] == "command" and action >= BALL_ACTION and len(prev["party"]) == 6:
+            reward -= cfg.ball_cost
         if cfg.boss_coef and obs["wave"] > prev["wave"] and obs["wave"] % 10 == 0:
             reward += cfg.boss_coef * min(5, max(-10, boss_gap(obs["wave"], obs["party"])))
         if obs["wave"] == prev["wave"]:

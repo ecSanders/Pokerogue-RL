@@ -156,5 +156,19 @@ def encode(obs: dict) -> dict[str, np.ndarray]:
     return {"species": species, "ability": ability, "moves": moves, "mon": mon, "move": move, "glob": glob, "mask": mask}
 
 
+BALL_ACTION = 10  # command actions 10-14 throw Poke/Great/Ultra/Rogue/Master Ball
+MASTER_BALL_ACTION = 14
+
+
+def restrict_boss_balls(obs: dict) -> dict:
+    """No ordinary balls against a boss: once its shields break it is catchable in principle, but the
+    odds are low and every miss is a turn the boss attacks for free (v4 threw on ~82% of its chances).
+    A Master Ball never misses, so it stays legal."""
+    if obs["kind"] != "command" or not any(e["boss"] and not e["fainted"] for e in obs["enemies"]):
+        return obs
+    legal = [ok and not BALL_ACTION <= i < MASTER_BALL_ACTION for i, ok in enumerate(obs["legal"])]
+    return {**obs, "legal": legal} if any(legal) else obs
+
+
 def stack(batch: list[dict[str, np.ndarray]]) -> dict[str, np.ndarray]:
     return {k: np.stack([b[k] for b in batch]) for k in batch[0]}

@@ -34,7 +34,7 @@ class PolicyAgent:
         if obs["kind"] not in self.kinds:
             return self.helper.act(obs)
         self.helper._update_carry(obs["party"])
-        obs = self.tm_memory.filter(obs)
+        obs = F.restrict_boss_balls(self.tm_memory.filter(obs))
         with torch.no_grad():
             logits, _ = self.policy(to_tensors(F.stack([encode_step(obs)]), torch.device("cpu")))
         if self.greedy:
