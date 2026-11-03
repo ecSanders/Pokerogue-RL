@@ -80,6 +80,10 @@ class RunPolicy(nn.Module):
         self.cand_enc = nn.Sequential(nn.Linear(cand_in, hidden), nn.ReLU())
         self.score = nn.Sequential(nn.Linear(2 * hidden, hidden), nn.ReLU(), nn.Linear(hidden, 1))
         self.value_head = nn.Linear(hidden, 1)
+        # Learned per-item logit offset; starts at 0. Lets training seed a prior for an item the
+        # behaviour-cloned start never picks (lures, see scripts/train_ppo.py --lure-prior).
+        self.item_bias = nn.Embedding(RF.ITEM_BUCKETS, 1)
+        nn.init.zeros_(self.item_bias.weight)
         nn.init.orthogonal_(self.score[-1].weight, gain=0.01)
         nn.init.zeros_(self.score[-1].bias)
 
@@ -99,6 +103,7 @@ class RunPolicy(nn.Module):
             batch["cand"], self.item_emb(batch["cand_item"]), self.move_emb(batch["cand_move"]), cand_mon,
         ], dim=-1))  # [n, C, hidden]
         logits = self.score(torch.cat([state.unsqueeze(1).expand_as(c), c], dim=-1)).squeeze(-1)
+        logits = logits + self.item_bias(batch["cand_item"]).squeeze(-1)
         return logits.masked_fill(~batch["mask"], -1e9), self.value_head(state).squeeze(-1)
 
 
@@ -168,7 +173,7 @@ class AgentPolicy(nn.Module):
 
 
 # Parameters added after checkpoints already existed; they start neutral (see _zero_linear).
-NEW_KEYS = ("ability_emb.", "ability_proj.")
+NEW_KEYS = ("ability_emb.", "ability_proj.", "item_bias.")
 
 
 def load_compatible(module: nn.Module, state: dict) -> None:

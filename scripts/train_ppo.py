@@ -27,7 +27,8 @@ sys.path.insert(0, str(ROOT))
 from pokerogue_rl.env import RewardConfig, VecBattleEnv  # noqa: E402
 from pokerogue_rl.features import BATTLE_KINDS  # noqa: E402
 from pokerogue_rl.policy import AgentPolicy  # noqa: E402
-from pokerogue_rl.run_features import RUN_KINDS  # noqa: E402
+from pokerogue_rl.run_features import RUN_KINDS, item_bucket  # noqa: E402
+from pokerogue_rl.strategy import LURES  # noqa: E402
 from pokerogue_rl.rollout import collect  # noqa: E402
 
 
@@ -55,6 +56,9 @@ def parse_args():
                    help="reward per double battle won (more EXP for the carry)")
     p.add_argument("--lure-bonus", type=float, default=0.0,
                    help="reward for picking a lure, which makes double battles more common")
+    p.add_argument("--lure-prior", type=float, default=None,
+                   help="set the run policy's logit offset for lures to this at the start (the BC-derived "
+                        "policies give lures ~1e-7 probability, so --lure-bonus is never discovered)")
     p.add_argument("--pokerus-coef", type=float, default=0.0,
                    help="reward shaping per party member gaining Pokerus (lost on release)")
     p.add_argument("--double-envs", type=int, default=0,
@@ -114,6 +118,10 @@ def main() -> None:
         run_init = AgentPolicy()
         run_init.load_checkpoint(args.run_init)
         policy.run.load_state_dict(run_init.run.state_dict())
+    if args.lure_prior is not None and not args.resume:
+        with torch.no_grad():
+            for item in LURES:
+                policy.run.item_bias.weight[item_bucket(item)] = args.lure_prior
 
     # Rollouts run per-env threads with small-batch inference on a CPU copy (faster than GPU there).
     actor = AgentPolicy()

@@ -28,7 +28,8 @@ v3-boss01           --init runs/run-exp-v2/policy.pt --run-policy --total-steps 
 v3-boss02           --init runs/run-exp-v2/policy.pt --run-policy --total-steps 10000000 --max-wave 500 --level-coef 0.1 --carry-coef 0.1 --pokerus-coef 0.3 --double-envs 4 --recycle-every 50 --ent-coef 0.01 --lr 1e-4 --boss-coef 0.2
 v3-boss03           --init runs/run-exp-v2/policy.pt --run-policy --total-steps 10000000 --max-wave 500 --level-coef 0.1 --carry-coef 0.1 --pokerus-coef 0.3 --double-envs 4 --recycle-every 50 --ent-coef 0.01 --lr 1e-4 --boss-coef 0.3
 v3-bc-boss02        --init runs/bc-run/v5_plus_bc_run.pt --run-policy --total-steps 10000000 --max-wave 500 --level-coef 0.1 --carry-coef 0.1 --pokerus-coef 0.3 --double-envs 4 --recycle-every 50 --ent-coef 0.01 --lr 1e-4 --boss-coef 0.2
-# Double battles: --double-coef per double battle won, --lure-bonus per lure picked. Local run-exp-v6
-# is v3 + boss 0.3 + double 0.3 + lure 0.2.
-v3-double03         --init runs/run-exp-v2/policy.pt --run-policy --total-steps 10000000 --max-wave 500 --level-coef 0.1 --carry-coef 0.1 --pokerus-coef 0.3 --double-envs 4 --recycle-every 50 --ent-coef 0.01 --lr 1e-4 --boss-coef 0.3 --double-coef 0.3 --lure-bonus 0.2
-v3-double06         --init runs/run-exp-v2/policy.pt --run-policy --total-steps 10000000 --max-wave 500 --level-coef 0.1 --carry-coef 0.1 --pokerus-coef 0.3 --double-envs 4 --recycle-every 50 --ent-coef 0.01 --lr 1e-4 --boss-coef 0.3 --double-coef 0.6 --lure-bonus 0.4
+# Double battles: --double-coef per double battle won, --lure-bonus per lure picked. --lure-prior 12
+# seeds the run policy's lure logit offset: the BC-derived start gives lures ~1e-7 probability (run-exp-v6
+# took none in 4M steps); +12 makes it ~4.5% per offer, about one lure per run.
+v3-double03         --init runs/run-exp-v2/policy.pt --run-policy --total-steps 10000000 --max-wave 500 --level-coef 0.1 --carry-coef 0.1 --pokerus-coef 0.3 --double-envs 4 --recycle-every 50 --ent-coef 0.01 --lr 1e-4 --boss-coef 0.3 --double-coef 0.3 --lure-bonus 0.2 --lure-prior 12
+v3-double06         --init runs/run-exp-v2/policy.pt --run-policy --total-steps 10000000 --max-wave 500 --level-coef 0.1 --carry-coef 0.1 --pokerus-coef 0.3 --double-envs 4 --recycle-every 50 --ent-coef 0.01 --lr 1e-4 --boss-coef 0.3 --double-coef 0.6 --lure-bonus 0.4 --lure-prior 12
