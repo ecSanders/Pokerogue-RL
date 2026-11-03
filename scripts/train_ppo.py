@@ -51,6 +51,10 @@ def parse_args():
                         "uncatchable boss wave (every 50th; clipped to -10..+5 levels)")
     p.add_argument("--ball-cost", type=float, default=0.0,
                    help="reward cost per ball thrown at a non-boss with a full party (catches earn no EXP)")
+    p.add_argument("--double-coef", type=float, default=0.0,
+                   help="reward per double battle won (more EXP for the carry)")
+    p.add_argument("--lure-bonus", type=float, default=0.0,
+                   help="reward for picking a lure, which makes double battles more common")
     p.add_argument("--pokerus-coef", type=float, default=0.0,
                    help="reward shaping per party member gaining Pokerus (lost on release)")
     p.add_argument("--double-envs", type=int, default=0,
@@ -119,7 +123,8 @@ def main() -> None:
                         seed_prefix=args.name, max_wave=args.max_wave,
                         reward=RewardConfig(gamma=args.gamma, level_coef=args.level_coef, carry_coef=args.carry_coef,
                                             pokerus_coef=args.pokerus_coef, boss_coef=args.boss_coef,
-                                            ball_cost=args.ball_cost),
+                                            ball_cost=args.ball_cost, double_coef=args.double_coef,
+                                            lure_bonus=args.lure_bonus),
                         policy_kinds=BATTLE_KINDS + (RUN_KINDS if args.run_policy else ()))
     envs.reset()
     n, t_len = args.num_envs, args.rollout

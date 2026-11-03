@@ -45,7 +45,7 @@ from pokerogue_rl.agents.heuristic import HeuristicAgent
 from pokerogue_rl.features import BALL_ACTION, BATTLE_KINDS, boss_on_field
 from pokerogue_rl.run_features import TmMemory
 from pokerogue_rl.sim_client import SimClient, SimError, launch_sims
-from pokerogue_rl.strategy import UNCATCHABLE_BOSS_EVERY, StrategyTracker, boss_gap, carry_level, pokerus_count
+from pokerogue_rl.strategy import LURES, UNCATCHABLE_BOSS_EVERY, StrategyTracker, boss_gap, carry_level, pokerus_count
 
 
 @dataclass
@@ -59,6 +59,8 @@ class RewardConfig:
     pokerus_coef: float = 0.0
     boss_coef: float = 0.0
     ball_cost: float = 0.0
+    double_coef: float = 0.0
+    lure_bonus: float = 0.0
 
 
 def team_health(obs: dict) -> float:
@@ -89,6 +91,7 @@ class BattleEnv:
         """`sim`: a client from a shared simulator group; launches its own simulator if omitted.
         `double_chance`: more double battles for practice (see SimClient.reset)."""
         self.double_chance = double_chance
+        self.in_double = False  # last command was in a double battle
         self.policy_kinds = tuple(policy_kinds)
         self.tm_memory = TmMemory()
         self.strategy = StrategyTracker()
@@ -148,6 +151,7 @@ class BattleEnv:
         self.episode_return = 0.0
         self.episode_steps = 0
         self.tracked = self.track_new
+        self.in_double = False
         return self.obs
 
     def step(self, action: int) -> tuple[dict, float, bool, dict]:
@@ -179,6 +183,14 @@ class BattleEnv:
             reward -= cfg.ball_cost
         if cfg.boss_coef and obs["wave"] > prev["wave"] and obs["wave"] % UNCATCHABLE_BOSS_EVERY == 0:
             reward += cfg.boss_coef * min(5, max(-10, boss_gap(obs["wave"], obs["party"])))
+        if prev["kind"] == "command":
+            self.in_double = bool(prev.get("double"))
+        if cfg.double_coef and obs["wave"] > prev["wave"] and self.in_double:
+            reward += cfg.double_coef  # a double battle won: more EXP for the carry
+            self.in_double = False
+        if (cfg.lure_bonus and prev["kind"] == "reward" and 0 <= action < len(prev["options"])
+                and prev["options"][action]["id"] in LURES):
+            reward += cfg.lure_bonus
         if obs["wave"] == prev["wave"]:
             reward += cfg.damage_coef * max(0.0, enemy_health(prev) - enemy_health(obs))
 
