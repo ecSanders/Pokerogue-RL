@@ -4,7 +4,7 @@
 # entropy bonus and learning rate, including a constant 5e-4, and the boss-readiness reward
 # (--boss-coef). Most runs start from run-exp-v2; the "bc" runs start from the behaviour-cloned
 # run policy, which never learned to farm catches.
-# No --ball-cost: run-exp-v5 (v3 +) cut throws from 0.47 to 0.14 per command but
+# No --ball-cost: run-exp-v5 (v3 + ball cost 0.5) cut throws from 0.47 to 0.14 per command but
 # evaluated worse (41.2 vs 44.5): catches are how fainted team members get replaced. Throws at the
 # wave-50 End-biome boss are already impossible. --boss-coef applies only at every 50th wave.
 # The double-battle arms test the "seek doubles for carry EXP" tip; no policy had taken a lure.
