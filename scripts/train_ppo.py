@@ -43,6 +43,15 @@ def parse_args():
     p.add_argument("--lr-schedule", choices=["linear", "constant"], default="linear",
                    help="linear: decay to 0 over --total-steps; constant: keep --lr")
     p.add_argument("--gamma", type=float, default=0.995)
+    p.add_argument("--wave-reward", type=float, default=1.0, help="reward per wave cleared")
+    p.add_argument("--team-coef", type=float, default=1.0, help="potential-based team-health shaping")
+    p.add_argument("--damage-coef", type=float, default=0.2, help="reward per enemy HP fraction removed")
+    p.add_argument("--exp-coef", type=float, default=0.0,
+                   help="reward per level gained (with progress to the next) by a Pokemon kept on the team")
+    p.add_argument("--exp-carry-bonus", type=float, default=0.0,
+                   help="EXP reward x (1 + this * the Pokemon's share of the team's EXP so far this run)")
+    p.add_argument("--faint-cost", type=float, default=0.0,
+                   help="cost per party member fainting (every one still standing at game over)")
     p.add_argument("--level-coef", type=float, default=0.0,
                    help="reward shaping per party level gained (see env.py)")
     p.add_argument("--carry-coef", type=float, default=0.0,
@@ -129,7 +138,10 @@ def main() -> None:
 
     envs = VecBattleEnv(args.num_envs, double_envs=args.double_envs, double_chance=args.double_chance,
                         seed_prefix=args.name, max_wave=args.max_wave,
-                        reward=RewardConfig(gamma=args.gamma, level_coef=args.level_coef, carry_coef=args.carry_coef,
+                        reward=RewardConfig(gamma=args.gamma, wave_reward=args.wave_reward, team_coef=args.team_coef,
+                                            damage_coef=args.damage_coef, exp_coef=args.exp_coef,
+                                            exp_carry_bonus=args.exp_carry_bonus, faint_cost=args.faint_cost,
+                                            level_coef=args.level_coef, carry_coef=args.carry_coef,
                                             pokerus_coef=args.pokerus_coef, boss_coef=args.boss_coef,
                                             ball_cost=args.ball_cost, double_coef=args.double_coef,
                                             lure_bonus=args.lure_bonus),

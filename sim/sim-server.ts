@@ -31,6 +31,7 @@ import { BattleScene } from "#app/battle-scene";
 import { getGameMode } from "#app/game-mode";
 import type { Phase } from "#app/phase";
 import { allMoves } from "#data/data-lists";
+import { getLevelTotalExp } from "#data/exp";
 import { getCriticalCaptureChance, getPokeballCatchMultiplier } from "#data/pokeball";
 import { getStatusEffectCatchRateMultiplier } from "#data/status-effect";
 import { AbilityId } from "#enums/ability-id";
@@ -1011,6 +1012,12 @@ class Sim {
     };
   }
 
+  /** Progress from the current level to the next, 0..1 (for level-based EXP rewards). */
+  private expFrac(p: Pokemon): number {
+    const span = getLevelTotalExp(p.level + 1, p.species.growthRate) - getLevelTotalExp(p.level, p.species.growthRate);
+    return span > 0 ? Math.min(1, Math.max(0, p.levelExp / span)) : 0;
+  }
+
   private encodePokemon(p: Pokemon, withDamage: boolean) {
     const enemies = withDamage ? this.scene.getEnemyField() : [];
     return {
@@ -1022,6 +1029,7 @@ class Sim {
       luck: p.getLuck(),
       pokerus: p.pokerus,
       level: p.level,
+      expFrac: this.expFrac(p),
       hp: p.hp,
       maxHp: p.getMaxHp(),
       stats: [0, 1, 2, 3, 4, 5].map(s => p.getStat(s)),
