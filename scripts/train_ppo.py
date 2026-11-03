@@ -12,6 +12,7 @@ Writes runs/<name>/log.jsonl (one line per update) and checkpoints runs/<name>/p
 import argparse
 import collections
 import json
+import signal
 import sys
 import time
 from pathlib import Path
@@ -45,10 +46,10 @@ def parse_args():
     p.add_argument("--carry-coef", type=float, default=0.0,
                    help="reward shaping per level gained by the highest-level member")
     p.add_argument("--boss-coef", type=float, default=0.0,
-                   help="reward per level the carry is above a boss wave's expected boss level on arrival "
-                        "(clipped to -10..+5 levels)")
+                   help="reward per level the carry is above the expected boss level on arriving at an "
+                        "uncatchable boss wave (every 50th; clipped to -10..+5 levels)")
     p.add_argument("--ball-cost", type=float, default=0.0,
-                   help="reward cost per ball thrown with a full party (catches there earn no EXP)")
+                   help="reward cost per ball thrown at a non-boss with a full party (catches earn no EXP)")
     p.add_argument("--pokerus-coef", type=float, default=0.0,
                    help="reward shaping per party member gaining Pokerus (lost on release)")
     p.add_argument("--double-envs", type=int, default=0,
@@ -80,6 +81,7 @@ def parse_args():
 
 def main() -> None:
     args = parse_args()
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))  # run the cleanup in `finally`
     torch.set_num_threads(1)  # leave CPU cores to the simulators; rollout threads infer in parallel
     device = torch.device(args.device)
     out = ROOT / "runs" / args.name
@@ -122,102 +124,104 @@ def main() -> None:
     recent = collections.deque(maxlen=100)  # finished episodes
     start = time.time()
 
-    for update in range(first_update, num_updates + 1):
-        for g in optimizer.param_groups:
-            g["lr"] = args.lr * (1 - (update - 1) / num_updates) if args.lr_schedule == "linear" else args.lr
+    try:
+        for update in range(first_update, num_updates + 1):
+            for g in optimizer.param_groups:
+                g["lr"] = args.lr * (1 - (update - 1) / num_updates) if args.lr_schedule == "linear" else args.lr
 
-        rollout_start = time.time()
-        rollout = collect(envs, actor, t_len)
-        recent.extend(rollout.episodes)
-        invalid, sim_errors = rollout.invalid, rollout.sim_errors
-        global_step += batch_size
-        rollout_time = time.time() - rollout_start
+            rollout_start = time.time()
+            rollout = collect(envs, actor, t_len)
+            recent.extend(rollout.episodes)
+            invalid, sim_errors = rollout.invalid, rollout.sim_errors
+            global_step += batch_size
+            rollout_time = time.time() - rollout_start
 
-        # GAE. Episodes end inside the rollout (done=1 cuts bootstrapping); bootstrap the tail.
-        to_dev = lambda a: torch.as_tensor(a, device=device)  # noqa: E731
-        values_t, rewards_t, dones_t = to_dev(rollout.values), to_dev(rollout.rewards), to_dev(rollout.dones)
-        next_value = to_dev(rollout.next_values)
-        advantages = torch.zeros_like(rewards_t)
-        last = torch.zeros(n, device=device)
-        for t in reversed(range(t_len)):
-            nv = next_value if t == t_len - 1 else values_t[t + 1]
-            nonterminal = 1.0 - dones_t[t]
-            delta = rewards_t[t] + args.gamma * nv * nonterminal - values_t[t]
-            last = delta + args.gamma * args.gae_lambda * nonterminal * last
-            advantages[t] = last
-        returns = advantages + values_t
+            # GAE. Episodes end inside the rollout (done=1 cuts bootstrapping); bootstrap the tail.
+            to_dev = lambda a: torch.as_tensor(a, device=device)  # noqa: E731
+            values_t, rewards_t, dones_t = to_dev(rollout.values), to_dev(rollout.rewards), to_dev(rollout.dones)
+            next_value = to_dev(rollout.next_values)
+            advantages = torch.zeros_like(rewards_t)
+            last = torch.zeros(n, device=device)
+            for t in reversed(range(t_len)):
+                nv = next_value if t == t_len - 1 else values_t[t + 1]
+                nonterminal = 1.0 - dones_t[t]
+                delta = rewards_t[t] + args.gamma * nv * nonterminal - values_t[t]
+                last = delta + args.gamma * args.gae_lambda * nonterminal * last
+                advantages[t] = last
+            returns = advantages + values_t
 
-        flat = {k: to_dev(v.reshape(batch_size, *v.shape[2:])) for k, v in rollout.feats.items()}
-        b_actions = to_dev(rollout.actions).flatten()
-        run_frac = flat["is_run"].float().mean().item()
-        b_logps, b_adv, b_ret = to_dev(rollout.logps).flatten(), advantages.flatten(), returns.flatten()
+            flat = {k: to_dev(v.reshape(batch_size, *v.shape[2:])) for k, v in rollout.feats.items()}
+            b_actions = to_dev(rollout.actions).flatten()
+            run_frac = flat["is_run"].float().mean().item()
+            b_logps, b_adv, b_ret = to_dev(rollout.logps).flatten(), advantages.flatten(), returns.flatten()
 
-        stats = collections.defaultdict(list)
-        mb_size = batch_size // args.minibatches
-        for _ in range(args.epochs):
-            perm = torch.randperm(batch_size, device=device)
-            for i in range(0, batch_size, mb_size):
-                idx = perm[i:i + mb_size]
-                logits, value = policy({k: v[idx] for k, v in flat.items()})
-                dist = torch.distributions.Categorical(logits=logits)
-                new_logp = dist.log_prob(b_actions[idx])
-                ratio = (new_logp - b_logps[idx]).exp()
-                adv = b_adv[idx]
-                adv = (adv - adv.mean()) / (adv.std() + 1e-8)
-                pg_loss = torch.max(-adv * ratio, -adv * ratio.clamp(1 - args.clip, 1 + args.clip)).mean()
-                v_loss = 0.5 * (value - b_ret[idx]).pow(2).mean()
-                entropy = dist.entropy().mean()
-                loss = pg_loss + args.vf_coef * v_loss - args.ent_coef * entropy
-                optimizer.zero_grad()
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(policy.parameters(), args.max_grad_norm)
-                optimizer.step()
-                stats["pg_loss"].append(pg_loss.item())
-                stats["v_loss"].append(v_loss.item())
-                stats["entropy"].append(entropy.item())
-                is_run = flat["is_run"][idx]
-                if is_run.any():
-                    stats["run_entropy"].append(dist.entropy()[is_run].mean().item())
-                stats["clipfrac"].append(((ratio - 1).abs() > args.clip).float().mean().item())
+            stats = collections.defaultdict(list)
+            mb_size = batch_size // args.minibatches
+            for _ in range(args.epochs):
+                perm = torch.randperm(batch_size, device=device)
+                for i in range(0, batch_size, mb_size):
+                    idx = perm[i:i + mb_size]
+                    logits, value = policy({k: v[idx] for k, v in flat.items()})
+                    dist = torch.distributions.Categorical(logits=logits)
+                    new_logp = dist.log_prob(b_actions[idx])
+                    ratio = (new_logp - b_logps[idx]).exp()
+                    adv = b_adv[idx]
+                    adv = (adv - adv.mean()) / (adv.std() + 1e-8)
+                    pg_loss = torch.max(-adv * ratio, -adv * ratio.clamp(1 - args.clip, 1 + args.clip)).mean()
+                    v_loss = 0.5 * (value - b_ret[idx]).pow(2).mean()
+                    entropy = dist.entropy().mean()
+                    loss = pg_loss + args.vf_coef * v_loss - args.ent_coef * entropy
+                    optimizer.zero_grad()
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(policy.parameters(), args.max_grad_norm)
+                    optimizer.step()
+                    stats["pg_loss"].append(pg_loss.item())
+                    stats["v_loss"].append(v_loss.item())
+                    stats["entropy"].append(entropy.item())
+                    is_run = flat["is_run"][idx]
+                    if is_run.any():
+                        stats["run_entropy"].append(dist.entropy()[is_run].mean().item())
+                    stats["clipfrac"].append(((ratio - 1).abs() > args.clip).float().mean().item())
 
-        actor.load_state_dict({k: v.cpu() for k, v in policy.state_dict().items()})
+            actor.load_state_dict({k: v.cpu() for k, v in policy.state_dict().items()})
 
-        waves = [e["wave"] for e in recent]
-        row = {
-            "update": update, "step": global_step, "time": round(time.time() - start),
-            "sps": round(batch_size / rollout_time), "lr": optimizer.param_groups[0]["lr"],
-            "episodes": len(recent),
-            "wave_mean": round(float(np.mean(waves)), 2) if waves else None,
-            "wave_median": float(np.median(waves)) if waves else None,
-            "return_mean": round(float(np.mean([e["return"] for e in recent])), 3) if recent else None,
-            # Strategy measures over recent episodes (see pokerogue_rl/strategy.py).
-            **{k: round(float(np.mean([e[k] for e in recent])), 3) if recent else None
-               for k in ("double_frac", "pickup_frac", "lures", "ball_frac", "carry_gap", "pokerus")},
-            "boss_gap": round(float(np.mean(g)), 2) if (g := [e["boss_gap"] for e in recent
-                                                              if e.get("boss_gap") is not None]) else None,
-            "invalid": invalid,
-            "sim_errors": sim_errors,
-            "run_frac": round(run_frac, 3),
-            **{k: round(float(np.mean(v)), 4) for k, v in stats.items()},
-        }
-        with (out / "log.jsonl").open("a") as f:
-            f.write(json.dumps(row) + "\n")
-        print(" ".join(f"{k}={v}" for k, v in row.items()), flush=True)
+            waves = [e["wave"] for e in recent]
+            row = {
+                "update": update, "step": global_step, "time": round(time.time() - start),
+                "sps": round(batch_size / rollout_time), "lr": optimizer.param_groups[0]["lr"],
+                "episodes": len(recent),
+                "wave_mean": round(float(np.mean(waves)), 2) if waves else None,
+                "wave_median": float(np.median(waves)) if waves else None,
+                "return_mean": round(float(np.mean([e["return"] for e in recent])), 3) if recent else None,
+                # Strategy measures over recent episodes (see pokerogue_rl/strategy.py).
+                **{k: round(float(np.mean([e[k] for e in recent])), 3) if recent else None
+                   for k in ("double_frac", "pickup_frac", "lures", "ball_frac", "carry_gap", "pokerus")},
+                "boss_gap": round(float(np.mean(g)), 2) if (g := [e["boss_gap"] for e in recent
+                                                                  if e.get("boss_gap") is not None]) else None,
+                "invalid": invalid,
+                "sim_errors": sim_errors,
+                "run_frac": round(run_frac, 3),
+                **{k: round(float(np.mean(v)), 4) for k, v in stats.items()},
+            }
+            with (out / "log.jsonl").open("a") as f:
+                f.write(json.dumps(row) + "\n")
+            print(" ".join(f"{k}={v}" for k, v in row.items()), flush=True)
 
-        if update % args.save_every == 0 or update == num_updates:
-            # Write then rename, so a job killed mid-save (e.g. Slurm preemption) keeps the last good checkpoint.
-            torch.save({"policy": policy.state_dict(), "optimizer": optimizer.state_dict(), "update": update,
-                        "step": global_step, "args": vars(args)}, out / "policy.pt.tmp")
-            (out / "policy.pt.tmp").replace(out / "policy.pt")
-        if update % args.recycle_every == 0 and update < num_updates and not envs.draining:
-            envs.start_drain()
-            drain_start = update
-        if envs.draining and update < num_updates and (envs.drained or update - drain_start >= args.recycle_max_wait):
-            cut = envs.recycle()
-            print(f"recycled simulators after waiting {update - drain_start} updates"
-                  + (f"; cut {cut} unfinished episodes" if cut else ""), flush=True)
-
-    envs.close()
+            if update % args.save_every == 0 or update == num_updates:
+                # Write then rename, so a job killed mid-save (e.g. Slurm preemption) keeps the last good checkpoint.
+                torch.save({"policy": policy.state_dict(), "optimizer": optimizer.state_dict(), "update": update,
+                            "step": global_step, "args": vars(args)}, out / "policy.pt.tmp")
+                (out / "policy.pt.tmp").replace(out / "policy.pt")
+            if update % args.recycle_every == 0 and update < num_updates and not envs.draining:
+                envs.start_drain()
+                drain_start = update
+            if envs.draining and update < num_updates and (envs.drained or update - drain_start >= args.recycle_max_wait):
+                cut = envs.recycle()
+                print(f"recycled simulators after waiting {update - drain_start} updates"
+                      + (f"; cut {cut} unfinished episodes" if cut else ""), flush=True)
+    finally:
+        # Also on Ctrl-C or SIGTERM (Slurm requeue), or the simulator processes outlive the trainer.
+        envs.close()
 
 
 if __name__ == "__main__":

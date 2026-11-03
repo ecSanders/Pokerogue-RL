@@ -4,7 +4,8 @@
 - a Pickup user in the team
 - Pokerus kept until the whole team has it
 - double battles sought with lures, for more EXP
-- a carry at or above the level of the boss every 10th wave (most runs die to these bosses)
+- a carry at or above the level of the boss every 50th wave: there the End biome's Paradox boss can't
+  be caught, so it must be beaten (other bosses are mostly caught once their shields break)
 
 StrategyTracker watches every decision of a run (`note`) and summarises it at the end (`summary`).
 """
@@ -23,6 +24,9 @@ def pokerus_count(party: list[dict]) -> int:
 
 def carry_level(party: list[dict]) -> int:
     return max((p["level"] for p in party), default=0)
+
+
+UNCATCHABLE_BOSS_EVERY = 50  # endless: every 50th wave is the End biome, where the boss can't be caught
 
 
 def boss_level(wave: int) -> int:
@@ -50,7 +54,7 @@ class StrategyTracker:
         self.commands = 0
         self.full_pokerus_wave: int | None = None
         self.last_party: list[dict] = []
-        self.boss_gaps: dict[int, int] = {}  # boss wave -> carry level minus boss level, on arrival
+        self.boss_gaps: dict[int, int] = {}  # uncatchable boss wave -> carry minus boss level, on arrival
 
     def note(self, obs: dict, action: int) -> None:
         wave, party = obs["wave"], obs["party"]
@@ -64,7 +68,7 @@ class StrategyTracker:
                 self.double_waves.add(wave)
             if any(p.get("ability") == PICKUP for p in party):
                 self.pickup_waves.add(wave)
-            if wave % 10 == 0 and wave not in self.boss_gaps:
+            if wave % UNCATCHABLE_BOSS_EVERY == 0 and wave not in self.boss_gaps:
                 self.boss_gaps[wave] = boss_gap(wave, party)
             if self.full_pokerus_wave is None and len(party) == 6 and pokerus_count(party) == 6:
                 self.full_pokerus_wave = wave
@@ -84,7 +88,6 @@ class StrategyTracker:
             "carry_gap": round(carry_level(party) - sum(levels) / len(levels), 1) if levels else 0.0,
             "pokerus": pokerus_count(party),
             "full_pokerus_wave": self.full_pokerus_wave,
-            # At the last boss wave reached, usually the one that ended the run (the early bosses are
-            # easy, so a mean over all of them hides the shortfall). None if the run reached none.
+            # At the last uncatchable boss reached (wave 50, 100, ...). None if the run reached none.
             "boss_gap": self.boss_gaps[max(self.boss_gaps)] if self.boss_gaps else None,
         }

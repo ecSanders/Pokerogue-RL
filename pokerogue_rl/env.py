@@ -11,8 +11,8 @@ Reward per policy step:
   + LEVEL_COEF * levels gained by kept Pokemon         (shaping: EXP now pays off at boss waves later)
   + CARRY_COEF * change in kept carry level            (shaping: one carry takes the EXP and items)
   + POKERUS_COEF * (pokerus' - pokerus)               (shaping: keep a carrier until all have it)
-  + BOSS_COEF * clip(carry - boss level, -10, +5)      (on arriving at a boss wave: be ready for it)
-  - BALL_COST per ball thrown with a full party         (catching clears a wave with no EXP)
+  + BOSS_COEF * clip(carry - boss level, -10, +5)      (arriving at an uncatchable boss: be ready for it)
+  - BALL_COST per ball thrown at a non-boss, full party (catching clears a wave with no EXP)
 team_health = sum of party HP fractions / 6, so fainted members count 0; 0 at game over.
 Level shaping rewards EXP: without it, catching (no EXP) clears wild waves as well as a KO does, and
 the under-levelled team then dies to the wave-50 boss, beyond the discount horizon. Both level terms
@@ -22,14 +22,15 @@ nearly every wild wave and churn its bench.
 Level shaping is undiscounted: the gamma * potential form costs (1 - gamma) * levels every step,
 which grows with the team and would reward ending waves in fewer turns, i.e. catching.
 carry: highest level among those Pokemon (releasing the carry costs its level); pokerus = party members with Pokerus (1.5x EXP, spreads).
-Boss readiness: every 10th wave is a boss, and most runs end there with a healthy team that is simply
-under-levelled (the carry ~4 levels below the boss). On arriving at a boss wave, the carry's level is
-compared with the boss's expected level (strategy.boss_level): below it costs up to 10 * BOSS_COEF,
-above it pays up to 5 * BOSS_COEF, so a carry kept ahead of the curve pays at every boss.
-Ball cost: a catch clears a wave for the same WAVE_REWARD as a KO and costs no team health, but earns
-no EXP. With a full party the catch is then released or let go, so v4 threw a ball on 67% of its
-full-party commands and reached bosses under-levelled. Throws with room in the party stay free.
-Ordinary balls are also illegal against bosses (features.restrict_boss_balls).
+Boss readiness: every 10th wave is a boss. v3 wins 72% of its boss waves by catching the boss once its
+shields break, except at wave 50 (and every 50th): that is the End biome, whose Paradox boss can't be
+caught, so it must be beaten, and v3 lost 30 of 43 there. On arriving at such a wave, the carry's level
+is compared with the boss's expected level (strategy.boss_level): below it costs up to 10 * BOSS_COEF,
+above it pays up to 5 * BOSS_COEF.
+Ball cost: a catch clears a wild wave for the same WAVE_REWARD as a KO and costs no team health, but
+earns no EXP. With a full party the catch is then released or let go, so v4 threw a ball on 67% of its
+full-party commands and reached wave 50 under-levelled. Throws with room in the party, and throws at
+bosses (catching one is how most boss waves are won), stay free.
 """
 
 from __future__ import annotations
@@ -41,10 +42,10 @@ from dataclasses import dataclass
 import numpy as np
 
 from pokerogue_rl.agents.heuristic import HeuristicAgent
-from pokerogue_rl.features import BALL_ACTION, BATTLE_KINDS, restrict_boss_balls
+from pokerogue_rl.features import BALL_ACTION, BATTLE_KINDS, boss_on_field
 from pokerogue_rl.run_features import TmMemory
 from pokerogue_rl.sim_client import SimClient, SimError, launch_sims
-from pokerogue_rl.strategy import StrategyTracker, boss_gap, carry_level, pokerus_count
+from pokerogue_rl.strategy import UNCATCHABLE_BOSS_EVERY, StrategyTracker, boss_gap, carry_level, pokerus_count
 
 
 @dataclass
@@ -113,7 +114,7 @@ class BattleEnv:
             self.strategy.note(resp["obs"], action)
             resp = self.sim.step(action)
         if not resp["done"]:
-            resp = {**resp, "obs": restrict_boss_balls(self.tm_memory.filter(resp["obs"]))}
+            resp = {**resp, "obs": self.tm_memory.filter(resp["obs"])}
         return resp
 
     def _restart_sim(self, error: Exception) -> None:
@@ -170,9 +171,10 @@ class BattleEnv:
             reward += cfg.carry_coef * carry_gain(prev["party"], obs["party"])
         if cfg.pokerus_coef:
             reward += cfg.pokerus_coef * (pokerus_count(obs["party"]) - pokerus_count(prev["party"]))
-        if cfg.ball_cost and prev["kind"] == "command" and action >= BALL_ACTION and len(prev["party"]) == 6:
+        if (cfg.ball_cost and prev["kind"] == "command" and action >= BALL_ACTION and len(prev["party"]) == 6
+                and not boss_on_field(prev)):
             reward -= cfg.ball_cost
-        if cfg.boss_coef and obs["wave"] > prev["wave"] and obs["wave"] % 10 == 0:
+        if cfg.boss_coef and obs["wave"] > prev["wave"] and obs["wave"] % UNCATCHABLE_BOSS_EVERY == 0:
             reward += cfg.boss_coef * min(5, max(-10, boss_gap(obs["wave"], obs["party"])))
         if obs["wave"] == prev["wave"]:
             reward += cfg.damage_coef * max(0.0, enemy_health(prev) - enemy_health(obs))
