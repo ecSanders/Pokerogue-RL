@@ -12,6 +12,7 @@ Writes runs/<name>/log.jsonl (one line per update) and checkpoints runs/<name>/p
 import argparse
 import collections
 import json
+import os
 import signal
 import sys
 import time
@@ -81,7 +82,10 @@ def parse_args():
 
 def main() -> None:
     args = parse_args()
-    signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))  # run the cleanup in `finally`
+    def on_sigterm(signum, frame):
+        print(f"received SIGTERM (pid {os.getpid()}, parent {os.getppid()}); stopping", flush=True)
+        sys.exit(143)  # run the cleanup in `finally`
+    signal.signal(signal.SIGTERM, on_sigterm)
     torch.set_num_threads(1)  # leave CPU cores to the simulators; rollout threads infer in parallel
     device = torch.device(args.device)
     out = ROOT / "runs" / args.name

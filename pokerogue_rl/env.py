@@ -106,6 +106,7 @@ class BattleEnv:
         self.pending = False
         self.tracked = True
         self.track_new = True
+        self.closing = False  # set on shutdown, so a closed simulator isn't mistaken for a crash
 
     def _play_until_policy(self, resp: dict) -> dict:
         """Let the heuristic answer other decisions until the policy has one of its own."""
@@ -119,6 +120,8 @@ class BattleEnv:
 
     def _restart_sim(self, error: Exception) -> None:
         """Replace a simulator that errored or hung, so one bad episode can't end a training run."""
+        if self.closing:
+            raise SimError(f"shutting down ({error!r})")
         self.sim_errors += 1
         print(f"[env] simulator error ({error!r}); replacing it with a standalone one", flush=True)
         if self.sim.owns_proc:
@@ -254,6 +257,10 @@ class VecBattleEnv:
         return cut
 
     def close(self) -> None:
+        # Rollout threads may still be stepping (e.g. after Ctrl-C in the main thread): stop them from
+        # replacing the simulators being closed under them.
+        for env in self.envs:
+            env.closing = True
         list(self.pool.map(lambda e: e.close(), self.envs))
         self.pool.shutdown()
         self.group.close()
