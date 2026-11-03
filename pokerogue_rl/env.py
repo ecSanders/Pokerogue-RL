@@ -13,12 +13,14 @@ Reward per policy step:
   + POKERUS_COEF * (pokerus' - pokerus)               (shaping: keep a carrier until all have it)
   + BOSS_COEF * clip(carry - boss level, -10, +5)      (arriving at an uncatchable boss: be ready for it)
   - BALL_COST per ball thrown at a non-boss, full party (catching clears a wave with no EXP)
-  + EXP_COEF * sum over kept Pokemon of levels gained (incl. progress to the next level)
-      * (1 + EXP_CARRY_BONUS * that Pokemon's share of the levels gained earlier in the run)
-  - FAINT_COST per party member fainting (each one still standing at game over)
+  + EXP_COEF * sum over kept Pokemon of levels gained (incl. progress to the next level), the step's
+      largest gainer weighted 1 + EXP_CARRY_BONUS * min(streak - 1, 10) / 10, streak = consecutive EXP
+      steps whose largest gainer was that same Pokemon (resets when another Pokemon is the largest)
+  - FAINT_COST * k for each party member fainting, k = team members fainted counting it (1, 2, 3, ...;
+      everyone still standing faints at game over)
 The EXP and faint terms are the minimal-shaping alternative (exp-v1, 2026-11-03): run with
 --wave-reward 0 --team-coef 0 --damage-coef 0 and nothing else. The agent is paid only for EXP, more
-for concentrating it on one Pokemon (the carry), and pays for losing Pokemon; surviving longer is how it
+for feeding it to the same Pokemon (the carry) step after step, and pays for losing Pokemon; surviving longer is how it
 earns more EXP. Levels, not raw EXP points, since EXP per level grows roughly cubically.
 team_health = sum of party HP fractions / 6, so fainted members count 0; 0 at game over.
 Level shaping rewards EXP: without it, catching (no EXP) clears wild waves as well as a KO does, and
@@ -90,17 +92,22 @@ def carry_gain(prev: list[dict], nxt: list[dict]) -> float:
     return float(max(kept, default=0) - carry_level(prev))
 
 
+EXP_STREAK_CAP = 10  # consecutive EXP steps to the same Pokemon until the full carry bonus
+
+
 def exp_progress(p: dict) -> float:
     """Level plus progress toward the next one (expFrac; older simulators lack it)."""
     return p["level"] + p.get("expFrac", 0.0)
 
 
-def faints(prev: dict, obs: dict, game_over: bool) -> int:
-    """Party members alive before the step and fainted after it (all of them at game over)."""
+def faint_penalty(prev: dict, obs: dict, game_over: bool) -> int:
+    """Escalating faint penalty, in units of FAINT_COST: each party member that faints this step costs
+    the number of team members fainted once it has (1st down = 1, 2nd = 2, ...). At game over every
+    member still standing faints."""
+    already = sum(1 for p in prev["party"] if p["fainted"])
     alive = {p["uid"] for p in prev["party"] if not p["fainted"]}
-    if game_over:
-        return len(alive)
-    return sum(1 for p in obs["party"] if p["uid"] in alive and p["fainted"])
+    new = len(alive) if game_over else sum(1 for p in obs["party"] if p["uid"] in alive and p["fainted"])
+    return sum(already + j for j in range(1, new + 1))
 
 
 def enemy_health(obs: dict) -> float:
@@ -115,7 +122,8 @@ class BattleEnv:
         `double_chance`: more double battles for practice (see SimClient.reset)."""
         self.double_chance = double_chance
         self.in_double = False  # last command was in a double battle
-        self.exp_received: dict[int, float] = {}
+        self.exp_streak_uid: int | None = None
+        self.exp_streak = 0
         self.policy_kinds = tuple(policy_kinds)
         self.tm_memory = TmMemory()
         self.strategy = StrategyTracker()
@@ -176,7 +184,8 @@ class BattleEnv:
         self.episode_steps = 0
         self.tracked = self.track_new
         self.in_double = False
-        self.exp_received: dict[int, float] = {}  # uid -> levels gained this run
+        self.exp_streak_uid: int | None = None  # last step's largest EXP gainer
+        self.exp_streak = 0
         return self.obs
 
     def step(self, action: int) -> tuple[dict, float, bool, dict]:
@@ -201,7 +210,7 @@ class BattleEnv:
         if cfg.exp_coef:
             reward += cfg.exp_coef * self._exp_reward(prev["party"], obs["party"], cfg.exp_carry_bonus)
         if cfg.faint_cost:
-            reward -= cfg.faint_cost * faints(prev, obs, game_over)
+            reward -= cfg.faint_cost * faint_penalty(prev, obs, game_over)
         if cfg.level_coef:
             reward += cfg.level_coef * exp_levels(prev["party"], obs["party"])
         if cfg.carry_coef:
@@ -239,20 +248,20 @@ class BattleEnv:
         return obs, reward, done, info
 
     def _exp_reward(self, prev: list[dict], nxt: list[dict], carry_bonus: float) -> float:
-        """Levels gained (with partial progress) by Pokemon on the team before and after, each weighted
-        by 1 + carry_bonus * its share of the levels the team gained earlier in the run."""
+        """Levels gained (with partial progress) by Pokemon on the team before and after. The largest
+        gainer of the step is the recipient; consecutive steps with the same recipient build a streak,
+        and its gain is weighted 1 + carry_bonus * min(streak - 1, EXP_STREAK_CAP) / EXP_STREAK_CAP.
+        Other gainers are paid x1 and don't break the streak."""
         before = {p["uid"]: exp_progress(p) for p in prev}
-        total = sum(self.exp_received.values())
-        out = 0.0
-        for p in nxt:
-            if p["uid"] not in before:
-                continue
-            gain = max(0.0, exp_progress(p) - before[p["uid"]])
-            if gain:
-                share = self.exp_received.get(p["uid"], 0.0) / total if total > 0 else 0.0
-                out += gain * (1 + carry_bonus * share)
-                self.exp_received[p["uid"]] = self.exp_received.get(p["uid"], 0.0) + gain
-        return out
+        gains = {p["uid"]: max(0.0, exp_progress(p) - before[p["uid"]]) for p in nxt if p["uid"] in before}
+        gains = {uid: g for uid, g in gains.items() if g > 0}
+        if not gains:
+            return 0.0
+        top = max(gains, key=gains.get)
+        self.exp_streak = self.exp_streak + 1 if top == self.exp_streak_uid else 1
+        self.exp_streak_uid = top
+        weight = 1 + carry_bonus * min(self.exp_streak - 1, EXP_STREAK_CAP) / EXP_STREAK_CAP
+        return sum(gains.values()) + (weight - 1) * gains[top]
 
     def close(self) -> None:
         self.sim.close()

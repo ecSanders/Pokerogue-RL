@@ -49,9 +49,11 @@ def parse_args():
     p.add_argument("--exp-coef", type=float, default=0.0,
                    help="reward per level gained (with progress to the next) by a Pokemon kept on the team")
     p.add_argument("--exp-carry-bonus", type=float, default=0.0,
-                   help="EXP reward x (1 + this * the Pokemon's share of the team's EXP so far this run)")
+                   help="EXP streak bonus: the step's largest gainer earns x(1 + this * min(streak - 1, 10) / 10), "
+                        "streak = consecutive EXP steps it was the largest gainer")
     p.add_argument("--faint-cost", type=float, default=0.0,
-                   help="cost per party member fainting (every one still standing at game over)")
+                   help="cost per party member fainting, times the number of team members fainted counting it "
+                        "(everyone still standing faints at game over)")
     p.add_argument("--level-coef", type=float, default=0.0,
                    help="reward shaping per party level gained (see env.py)")
     p.add_argument("--carry-coef", type=float, default=0.0,
