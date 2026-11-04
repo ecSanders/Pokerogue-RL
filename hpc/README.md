@@ -37,6 +37,31 @@ tail -f logs/slurm/v3-test-*.out
 - Resources come from `hpc/config.sh`. Override them for one submission with
   `SBATCH_EXTRA="--time=2:00:00" hpc/submit.sh ...`.
 
+## Several nodes training one model (optional)
+
+```bash
+hpc/submit.sh --nodes 4 big-run --run-policy --total-steps 40000000 ...   # one run on 4 nodes
+hpc/submit.sh --nodes 2 --sweep hpc/sweeps/FILE.txt                         # every sweep task on 2 nodes
+```
+
+`srun` starts one trainer per node. Each trainer runs its own simulators (`--num-envs` per node)
+and collects its own rollouts, and the trainers average their gradients after every minibatch, so
+they train one shared model (synchronous data-parallel PPO, `pokerogue_rl/distributed.py`).
+
+- An update covers `nodes × num_envs × rollout` steps: 4 nodes of 12 envs make a batch 4× the
+  local one, and `--total-steps` counts all nodes together. A larger batch gives less noisy
+  gradients but the same number of updates per sample, so give a multi-node run proportionally
+  more `--total-steps` for the same number of updates. You may also want a larger `--lr`.
+- Rank 0 writes the log and the checkpoint, and logs episodes from every node. `config.json`
+  records `world_size`. A checkpoint loads the same way on any number of nodes, including at home.
+- Each node uses its own seed stream (`NAME-r0`, `NAME-r1`, ...), so the nodes play different games.
+- Requeue and resume work as for one node. If one trainer fails, `srun --kill-on-bad-exit` stops
+  the others.
+- GPUs average gradients with NCCL, and CPU-only nodes use gloo. Every node must use the same
+  `--num-envs` and `--rollout`, which `job.sh` ensures.
+- The update waits for the slowest node's rollout each time, so mixed node types run at the speed
+  of the slowest one.
+
 ## Time limits and preemption
 
 Jobs run with `--requeue`. Five minutes before the time limit, Slurm signals the job, which

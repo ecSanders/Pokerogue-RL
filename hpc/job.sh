@@ -4,6 +4,7 @@
 # Arguments are "NAME [train_ppo.py args...]", or come from line SLURM_ARRAY_TASK_ID of SWEEP_FILE.
 # Resumes from runs/NAME/policy.pt if it exists. Five minutes before the time limit (or on
 # preemption) Slurm sends USR1; the job then stops training and requeues itself to continue.
+# With several nodes (submit.sh --nodes N) srun starts one trainer per node and they train one model.
 set -euo pipefail
 
 ROOT="${SLURM_SUBMIT_DIR:?run through hpc/submit.sh}"
@@ -36,8 +37,21 @@ if [[ -f "runs/$name/policy.pt" ]]; then
     args+=(--resume)
 fi
 
-echo "job ${SLURM_JOB_ID} on $(hostname): train_ppo.py --name $name ${args[*]}"
+nodes="${SLURM_NNODES:-1}"
+echo "job ${SLURM_JOB_ID} on $(hostname) ($nodes node(s)): train_ppo.py --name $name ${args[*]}"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null || echo "no GPU"
+launch=(python)
+if (( nodes > 1 )); then
+    # Rendezvous on the first node; the port is derived from the job id so jobs sharing a node differ.
+    MASTER_ADDR="$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)"
+    MASTER_PORT=$(( 20000 + SLURM_JOB_ID % 20000 ))
+    export MASTER_ADDR MASTER_PORT
+    echo "distributed: $nodes ranks, rendezvous $MASTER_ADDR:$MASTER_PORT"
+    # Recent Slurm doesn't pass the job's --cpus-per-task on to srun; --kill-on-bad-exit stops the
+    # other ranks (stuck in an all-reduce) if one fails.
+    launch=(srun --ntasks="$nodes" --ntasks-per-node=1 --cpus-per-task="${SLURM_CPUS_PER_TASK:-16}"
+            --kill-on-bad-exit=1 python)
+fi
 
 requeue() {
     echo "Time limit or preemption: stopping and requeueing"
@@ -48,6 +62,6 @@ requeue() {
 }
 trap requeue USR1
 
-python scripts/train_ppo.py --name "$name" "${args[@]}" &
+"${launch[@]}" scripts/train_ppo.py --name "$name" "${args[@]}" &
 train_pid=$!
 wait "$train_pid"

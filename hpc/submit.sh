@@ -2,8 +2,12 @@
 # Submit PPO training to Slurm with the resources in hpc/config.sh.
 #
 # Usage:
-#   hpc/submit.sh NAME [train_ppo.py args...]   one run, written to runs/NAME
-#   hpc/submit.sh --sweep FILE                  one array task per line of FILE: "NAME args..."
+#   hpc/submit.sh [--nodes N] NAME [train_ppo.py args...]   one run, written to runs/NAME
+#   hpc/submit.sh [--nodes N] --sweep FILE                  one array task per line of FILE: "NAME args..."
+#
+# --nodes N (default 1): N nodes train one model together, one trainer per node, gradients averaged
+# each minibatch (see pokerogue_rl/distributed.py). Each node runs its own simulators, so an update
+# covers N times the steps.
 #
 # Extra sbatch flags go in SBATCH_EXTRA, e.g. SBATCH_EXTRA="--time=4:00:00" hpc/submit.sh ...
 # Jobs resume from runs/NAME/policy.pt when it exists, so resubmitting a name continues that run.
@@ -16,8 +20,15 @@ cd "$ROOT"
 source hpc/config.sh
 mkdir -p logs/slurm
 
+nodes=1
+if [[ "${1:-}" == "--nodes" ]]; then
+    nodes="${2:?usage: hpc/submit.sh --nodes N ...}"
+    shift 2
+fi
+
 flags=(--cpus-per-task="$CPUS" --mem="$MEM" --time="$TIME" --requeue --signal=B:USR1@300
-       --open-mode=append)  # a requeued job keeps its earlier log
+       --open-mode=append  # a requeued job keeps its earlier log
+       --nodes="$nodes" --ntasks-per-node=1)
 [[ -n "${SLURM_ACCOUNT:-}" ]] && flags+=(--account="$SLURM_ACCOUNT")
 [[ -n "${SLURM_PARTITION:-}" ]] && flags+=(--partition="$SLURM_PARTITION")
 [[ -n "${SLURM_QOS:-}" ]] && flags+=(--qos="$SLURM_QOS")

@@ -7,6 +7,10 @@ Usage:
       --run-init runs/bc-run/policy.pt      # the policy also plays rewards, item targets, moves, releases
 
 Writes runs/<name>/log.jsonl (one line per update) and checkpoints runs/<name>/policy.pt.
+
+Multi-node (one model trained by several nodes, see pokerogue_rl/distributed.py and hpc/README.md):
+launch one process per node with srun or torchrun; each runs --num-envs simulators and the ranks
+average gradients. An update then covers world_size * num_envs * rollout steps.
 """
 
 import argparse
@@ -24,7 +28,9 @@ import torch
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+from pokerogue_rl.distributed import Dist  # noqa: E402
 from pokerogue_rl.env import RewardConfig, VecBattleEnv  # noqa: E402
+from pokerogue_rl.install_sim import install_sim  # noqa: E402
 from pokerogue_rl.features import BATTLE_KINDS  # noqa: E402
 from pokerogue_rl.policy import AgentPolicy  # noqa: E402
 from pokerogue_rl.run_features import RUN_KINDS, item_bucket  # noqa: E402
@@ -106,10 +112,15 @@ def main() -> None:
         sys.exit(143)  # run the cleanup in `finally`
     signal.signal(signal.SIGTERM, on_sigterm)
     torch.set_num_threads(1)  # leave CPU cores to the simulators; rollout threads infer in parallel
-    device = torch.device(args.device)
+    dd = Dist()
+    device = dd.device(args.device)
+    dd.init(device)
     out = ROOT / "runs" / args.name
-    out.mkdir(parents=True, exist_ok=True)
-    (out / "config.json").write_text(json.dumps(vars(args), indent=2))
+    if dd.main:
+        out.mkdir(parents=True, exist_ok=True)
+        (out / "config.json").write_text(json.dumps({**vars(args), "world_size": dd.world}, indent=2))
+        install_sim()  # once, before the other ranks' simulators read the shared checkout
+    dd.barrier()
 
     policy = AgentPolicy().to(device)
     optimizer = torch.optim.Adam(policy.parameters(), lr=args.lr, eps=1e-5)
@@ -120,7 +131,7 @@ def main() -> None:
         first_update, global_step = ckpt["update"] + 1, ckpt["step"]
         # Drop log rows written after the checkpoint; those updates are redone.
         log = out / "log.jsonl"
-        if log.exists():
+        if dd.main and log.exists():
             rows = [r for r in log.read_text().splitlines() if json.loads(r)["update"] <= ckpt["update"]]
             log.write_text("".join(r + "\n" for r in rows))
     elif args.init:
@@ -133,13 +144,14 @@ def main() -> None:
         with torch.no_grad():
             for item in LURES:
                 policy.run.item_bias.weight[item_bucket(item)] = args.lure_prior
+    dd.broadcast_params(policy)
 
     # Rollouts run per-env threads with small-batch inference on a CPU copy (faster than GPU there).
     actor = AgentPolicy()
     actor.load_state_dict(policy.state_dict())
 
     envs = VecBattleEnv(args.num_envs, double_envs=args.double_envs, double_chance=args.double_chance,
-                        seed_prefix=args.name, max_wave=args.max_wave,
+                        seed_prefix=f"{args.name}-r{dd.rank}" if dd.enabled else args.name, max_wave=args.max_wave,
                         reward=RewardConfig(gamma=args.gamma, wave_reward=args.wave_reward, team_coef=args.team_coef,
                                             damage_coef=args.damage_coef, exp_coef=args.exp_coef,
                                             exp_carry_bonus=args.exp_carry_bonus, faint_cost=args.faint_cost,
@@ -150,8 +162,8 @@ def main() -> None:
                         policy_kinds=BATTLE_KINDS + (RUN_KINDS if args.run_policy else ()))
     envs.reset()
     n, t_len = args.num_envs, args.rollout
-    batch_size = n * t_len
-    num_updates = args.total_steps // batch_size
+    batch_size = n * t_len  # this rank's
+    num_updates = args.total_steps // (batch_size * dd.world)
     recent = collections.deque(maxlen=100)  # finished episodes
     start = time.time()
 
@@ -162,10 +174,13 @@ def main() -> None:
 
             rollout_start = time.time()
             rollout = collect(envs, actor, t_len)
-            recent.extend(rollout.episodes)
-            invalid, sim_errors = rollout.invalid, rollout.sim_errors
-            global_step += batch_size
             rollout_time = time.time() - rollout_start
+            parts = dd.gather((rollout.episodes, rollout.invalid, rollout.sim_errors, rollout_time))
+            for eps, _, _, _ in parts:
+                recent.extend(eps)
+            invalid, sim_errors = sum(p[1] for p in parts), sum(p[2] for p in parts)
+            rollout_time = max(p[3] for p in parts)
+            global_step += batch_size * dd.world
 
             # GAE. Episodes end inside the rollout (done=1 cuts bootstrapping); bootstrap the tail.
             to_dev = lambda a: torch.as_tensor(a, device=device)  # noqa: E731
@@ -187,6 +202,7 @@ def main() -> None:
             b_logps, b_adv, b_ret = to_dev(rollout.logps).flatten(), advantages.flatten(), returns.flatten()
 
             stats = collections.defaultdict(list)
+            params = list(policy.parameters())
             mb_size = batch_size // args.minibatches
             for _ in range(args.epochs):
                 perm = torch.randperm(batch_size, device=device)
@@ -204,6 +220,7 @@ def main() -> None:
                     loss = pg_loss + args.vf_coef * v_loss - args.ent_coef * entropy
                     optimizer.zero_grad()
                     loss.backward()
+                    dd.average_grads(params)
                     torch.nn.utils.clip_grad_norm_(policy.parameters(), args.max_grad_norm)
                     optimizer.step()
                     stats["pg_loss"].append(pg_loss.item())
@@ -219,7 +236,7 @@ def main() -> None:
             waves = [e["wave"] for e in recent]
             row = {
                 "update": update, "step": global_step, "time": round(time.time() - start),
-                "sps": round(batch_size / rollout_time), "lr": optimizer.param_groups[0]["lr"],
+                "sps": round(batch_size * dd.world / rollout_time), "lr": optimizer.param_groups[0]["lr"],
                 "episodes": len(recent),
                 "wave_mean": round(float(np.mean(waves)), 2) if waves else None,
                 "wave_median": float(np.median(waves)) if waves else None,
@@ -234,11 +251,12 @@ def main() -> None:
                 "run_frac": round(run_frac, 3),
                 **{k: round(float(np.mean(v)), 4) for k, v in stats.items()},
             }
-            with (out / "log.jsonl").open("a") as f:
-                f.write(json.dumps(row) + "\n")
-            print(" ".join(f"{k}={v}" for k, v in row.items()), flush=True)
+            if dd.main:
+                with (out / "log.jsonl").open("a") as f:
+                    f.write(json.dumps(row) + "\n")
+                print(" ".join(f"{k}={v}" for k, v in row.items()), flush=True)
 
-            if update % args.save_every == 0 or update == num_updates:
+            if dd.main and (update % args.save_every == 0 or update == num_updates):
                 # Write then rename, so a job killed mid-save (e.g. Slurm preemption) keeps the last good checkpoint.
                 torch.save({"policy": policy.state_dict(), "optimizer": optimizer.state_dict(), "update": update,
                             "step": global_step, "args": vars(args)}, out / "policy.pt.tmp")
@@ -248,11 +266,12 @@ def main() -> None:
                 drain_start = update
             if envs.draining and update < num_updates and (envs.drained or update - drain_start >= args.recycle_max_wait):
                 cut = envs.recycle()
-                print(f"recycled simulators after waiting {update - drain_start} updates"
+                print(f"{'rank ' + str(dd.rank) + ': ' if dd.enabled else ''}recycled simulators after waiting {update - drain_start} updates"
                       + (f"; cut {cut} unfinished episodes" if cut else ""), flush=True)
     finally:
         # Also on Ctrl-C or SIGTERM (Slurm requeue), or the simulator processes outlive the trainer.
         envs.close()
+        dd.close()
 
 
 if __name__ == "__main__":
