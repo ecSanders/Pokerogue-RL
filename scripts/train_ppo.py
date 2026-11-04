@@ -36,6 +36,7 @@ from pokerogue_rl.policy import AgentPolicy  # noqa: E402
 from pokerogue_rl.run_features import RUN_KINDS, item_bucket  # noqa: E402
 from pokerogue_rl.strategy import LURES, gate_clears  # noqa: E402
 from pokerogue_rl.rollout import collect  # noqa: E402
+from pokerogue_rl.tracking import Tracker  # noqa: E402
 
 
 def parse_args():
@@ -102,6 +103,10 @@ def parse_args():
                    help="updates to wait for in-progress episodes to finish before a restart cuts them")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--save-every", type=int, default=10, help="updates between checkpoints")
+    p.add_argument("--clearml", action="store_true",
+                   help="track the run in ClearML (needs ~/clearml.conf): args, log charts, console, checkpoints")
+    p.add_argument("--clearml-upload-every", type=int, default=200,
+                   help="updates between checkpoint uploads to ClearML (0: only the final one)")
     return p.parse_args()
 
 
@@ -121,6 +126,9 @@ def main() -> None:
         (out / "config.json").write_text(json.dumps({**vars(args), "world_size": dd.world}, indent=2))
         install_sim()  # once, before the other ranks' simulators read the shared checkout
     dd.barrier()
+    # Rank 0 only: the other ranks' episodes reach it through dd.gather.
+    tracker = Tracker(args.clearml and dd.main, args.name, out, {**vars(args), "world_size": dd.world},
+                      resume=args.resume, upload_every=args.clearml_upload_every)
 
     policy = AgentPolicy().to(device)
     optimizer = torch.optim.Adam(policy.parameters(), lr=args.lr, eps=1e-5)
@@ -259,12 +267,14 @@ def main() -> None:
                 with (out / "log.jsonl").open("a") as f:
                     f.write(json.dumps(row) + "\n")
                 print(" ".join(f"{k}={v}" for k, v in row.items()), flush=True)
+                tracker.log(row, update)
 
             if dd.main and (update % args.save_every == 0 or update == num_updates):
                 # Write then rename, so a job killed mid-save (e.g. Slurm preemption) keeps the last good checkpoint.
                 torch.save({"policy": policy.state_dict(), "optimizer": optimizer.state_dict(), "update": update,
                             "step": global_step, "args": vars(args)}, out / "policy.pt.tmp")
                 (out / "policy.pt.tmp").replace(out / "policy.pt")
+                tracker.checkpoint(out / "policy.pt", update, final=update == num_updates)
             if update % args.recycle_every == 0 and update < num_updates and not envs.draining:
                 envs.start_drain()
                 drain_start = update
@@ -276,6 +286,7 @@ def main() -> None:
         # Also on Ctrl-C or SIGTERM (Slurm requeue), or the simulator processes outlive the trainer.
         envs.close()
         dd.close()
+        tracker.close()
 
 
 if __name__ == "__main__":
