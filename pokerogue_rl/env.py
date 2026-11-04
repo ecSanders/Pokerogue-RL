@@ -45,6 +45,7 @@ bosses (catching one is how most boss waves are won), stay free.
 from __future__ import annotations
 
 import itertools
+import pickle
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
@@ -142,15 +143,24 @@ class BattleEnv:
         self.tracked = True
         self.track_new = True
         self.closing = False  # set on shutdown, so a closed simulator isn't mistaken for a crash
+        # Snapshots (see snapshot/reset_from): whether self.obs is its wave's first decision, and the
+        # wave the current episode started on (1 unless it started from a snapshot).
+        self.at_wave_start = False
+        self.start_wave = 1
 
     def _play_until_policy(self, resp: dict) -> dict:
         """Let the heuristic answer other decisions until the policy has one of its own."""
+        helped_waves = set()
         while not resp["done"] and resp["obs"]["kind"] not in self.policy_kinds:
             action = self.helper.act(resp["obs"])
             self.strategy.note(resp["obs"], action)
+            helped_waves.add(resp["obs"]["wave"])
             resp = self.sim.step(action)
         if not resp["done"]:
             resp = {**resp, "obs": self.tm_memory.filter(resp["obs"])}
+        # The game saves at the start of each wave, just before its first decision. Unless the heuristic
+        # already answered some of this wave's decisions, this env's state matches that save.
+        self._clean_wave_start = resp["obs"]["wave"] not in helped_waves
         return resp
 
     def _restart_sim(self, error: Exception) -> None:
@@ -179,14 +189,54 @@ class BattleEnv:
                                                          double_chance=self.double_chance))
         if resp["done"]:  # ended before any battle decision; try another seed
             return self._reset()
-        self.obs = resp["obs"]
-        self.episode_return = 0.0
-        self.episode_steps = 0
-        self.tracked = self.track_new
         self.in_double = False
         self.exp_streak_uid: int | None = None  # last step's largest EXP gainer
         self.exp_streak = 0
+        return self._start_episode(resp)
+
+    def _start_episode(self, resp: dict) -> dict:
+        self.obs = resp["obs"]
+        self.start_wave = self.obs["wave"]
+        self.at_wave_start = self._clean_wave_start
+        self.episode_return = 0.0
+        self.episode_steps = 0
+        self.tracked = self.track_new
         return self.obs
+
+    # Env state that carries across waves and so must travel with a game snapshot.
+    _SNAPSHOT_STATE = ("helper", "tm_memory", "strategy", "exp_streak_uid", "exp_streak", "in_double")
+
+    def snapshot(self) -> dict | None:
+        """The current episode as of the start of this wave, to restart from with `reset_from`: the
+        game's wave-start save plus this env's own state (heuristic, strategy measures, EXP streak).
+
+        Only available at a wave's first decision, where the two agree; None elsewhere. Plain data
+        (strings and bytes), so it can be stored in a bank or sent between processes.
+        """
+        if not self.at_wave_start:
+            return None
+        game = self.sim.snapshot()
+        if game["wave"] != self.obs["wave"]:
+            return None
+        state = pickle.dumps({k: getattr(self, k) for k in self._SNAPSHOT_STATE})
+        return {"wave": game["wave"], "session": game["session"], "obs": self.obs, "state": state}
+
+    def reset_from(self, snap: dict, seed: str | None = None) -> dict:
+        """Start an episode from a `snapshot`. With `seed`, the rest of the run is re-rolled (the
+        snapshot wave's enemies are fixed by the save); without it, the same actions replay the run
+        the snapshot came from. Falls back to a fresh episode if the simulator fails."""
+        try:
+            resp = self.sim.load(snap["session"], seed=seed, max_wave=self.max_wave,
+                                 double_chance=self.double_chance)
+        except (SimError, OSError) as e:
+            self._restart_sim(e)
+            return self._reset()
+        for k, v in pickle.loads(snap["state"]).items():
+            setattr(self, k, v)
+        resp = self._play_until_policy(resp)
+        if resp["done"]:
+            return self._reset()
+        return self._start_episode(resp)
 
     def step(self, action: int) -> tuple[dict, float, bool, dict]:
         prev = self.obs
@@ -240,11 +290,13 @@ class BattleEnv:
             if self.tracked:
                 info["episode"] = {"wave": obs["wave"], "reason": resp["info"]["reason"],
                                    "return": self.episode_return, "steps": self.episode_steps,
-                                   **self.strategy.summary(obs)}
+                                   "start_wave": self.start_wave, **self.strategy.summary(obs)}
             self.pending = False
+            self.at_wave_start = False
             obs = self.reset()
         else:
             self.obs = obs
+            self.at_wave_start = obs["wave"] != prev["wave"] and self._clean_wave_start
         return obs, reward, done, info
 
     def _exp_reward(self, prev: list[dict], nxt: list[dict], carry_bonus: float) -> float:

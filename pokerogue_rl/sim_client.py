@@ -136,6 +136,24 @@ class SimClient:
     def step(self, action: int) -> dict:
         return self._request({"cmd": "step", "action": int(action)})
 
+    def snapshot(self) -> dict:
+        """{"wave", "session"}: the game's save from the start of the current wave (see Sim.snapshot)."""
+        resp = self._request({"cmd": "snapshot"})
+        return {"wave": resp["wave"], "session": resp["session"]}
+
+    def load(self, session: str, seed: str | None = None, max_wave: int | None = None,
+             double_chance: float | None = None) -> dict:
+        """Start an episode from a `snapshot` session, like `reset`. `seed` re-seeds the rest of the run;
+        without it the same actions replay the original run (see Sim.load)."""
+        msg = {"cmd": "load", "session": session}
+        if seed is not None:
+            msg["seed"] = seed
+        if max_wave is not None:
+            msg["maxWave"] = max_wave
+        if double_chance is not None:
+            msg["doubleChance"] = double_chance
+        return self._request(msg)
+
     def close(self) -> None:
         """Disconnect; stop the simulator if it was launched for us (and its process, if we own it)."""
         try:

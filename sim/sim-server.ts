@@ -6,6 +6,9 @@
  *
  *   -> {"cmd":"reset","seed":"abc","mode":"endless","starters":["CHARMANDER"],"maxWave":200}
  *   -> {"cmd":"step","action":3}
+ *   -> {"cmd":"snapshot"}   <- {"ok":true,"wave":41,"session":"..."}  (saved at the start of the current wave)
+ *   -> {"cmd":"load","session":"...","seed":"xyz","maxWave":200}   (like reset, from a snapshot's wave start;
+ *                                                                    seed optional: re-seeds the rest of the run)
  *   -> {"cmd":"close"}      (ends this connection; the server keeps listening)
  *   -> {"cmd":"shutdown"}   (stops the server)
  *   <- {"ok":true,"obs":{...},"done":false,"info":{...}}  |  {"ok":false,"error":"..."}
@@ -205,6 +208,8 @@ class Sim {
   private decisionsThisWave = 0;
   /** The scene's MockClock, patched by installManualClock. */
   private clock: any;
+  /** The session saved at the start of the current wave (see snapshot). */
+  private lastSession: { wave: number; session: string } | undefined;
 
   constructor(private readonly phaserGame: Phaser.Game) {
     onUnattendedLearnMove = () => this.count("learn_move_default");
@@ -219,27 +224,7 @@ class Sim {
   }
 
   async reset(opts: ResetOpts) {
-    this.stopWatchdog();
-    this.decision = undefined;
-    this.approvedLearnMove = undefined;
-    this.decisionWave = 0;
-    this.decisionsThisWave = 0;
-    clearInterval(PromptHandler.runInterval);
-    PromptHandler.runInterval = undefined;
-    // PromptHandler spies on ui.setModeInternal; re-spying an existing spy would recurse forever.
-    vi.restoreAllMocks();
-
-    this.game = new GameManager(this.phaserGame);
-    BattleScene.prototype.randBattleSeedInt = realRandBattleSeedInt;
-    this.installCaptureCounter();
-    this.installManualClock();
-    this.restoreBaseline();
-    this.manualClock = false; // the test framework's helpers below need the wall-clock interval
-    this.game.settings.battleStyle(BattleStyle.SET);
-    this.maxWave = opts.maxWave ?? Number.POSITIVE_INFINITY;
-    this.setDoubleChance(opts.doubleChance);
-    this.autoInputs = {};
-
+    this.prepare(opts);
     const mode = opts.mode === "classic" ? GameModes.CLASSIC : GameModes.ENDLESS;
     const species = (opts.starters ?? ["CHARMANDER", "SQUIRTLE", "BULBASAUR"]).map(name => {
       const id = SpeciesId[name as keyof typeof SpeciesId];
@@ -281,6 +266,82 @@ class Sim {
     this.manualClock = true;
     this.startWatchdog();
     return this.advance();
+  }
+
+  /**
+   * The session the game saved at the start of the current wave (as the real game does in
+   * EncounterPhase, before the encounter plays out), for `load` to restart from later. Wave-start
+   * state only: party, items, money, balls, arena, the wave's enemies and the run seed.
+   */
+  snapshot() {
+    if (!this.lastSession) {
+      throw new Error("no session saved yet");
+    }
+    return { ...this.lastSession };
+  }
+
+  /**
+   * Start an episode from a `snapshot` session, at the start of its wave, the way the real game
+   * resumes a saved run. `seed` replaces the session's run seed: the wave's enemies are already in
+   * the session, but the rest of the run (later encounters, battle RNG) then differs from the
+   * original. Without it, the same actions replay the original run.
+   */
+  async load(opts: ResetOpts & { session: string }) {
+    this.prepare(opts);
+    const raw = JSON.parse(opts.session);
+    if (opts.seed) {
+      raw.seed = opts.seed;
+    }
+    const session = JSON.stringify(raw);
+    const gameData = this.scene.gameData;
+    const data = gameData.parseSessionData(session);
+    vi.spyOn(gameData, "getSession").mockResolvedValue(data);
+    this.lastSession = { wave: data.waveIndex, session };
+
+    await this.game.runToTitle();
+    this.game.onNextPrompt("TitlePhase", UiMode.TITLE, () => {
+      (this.scene.phaseManager.getCurrentPhase() as any).loadSaveSlot(0);
+    });
+    await this.game.phaseInterceptor.to("EncounterPhase");
+
+    this.manualClock = true;
+    this.startWatchdog();
+    return this.advance();
+  }
+
+  /** Start-of-episode setup shared by reset and load: a fresh GameManager on the persistent scene. */
+  private prepare(opts: ResetOpts) {
+    this.stopWatchdog();
+    this.decision = undefined;
+    this.approvedLearnMove = undefined;
+    this.decisionWave = 0;
+    this.decisionsThisWave = 0;
+    clearInterval(PromptHandler.runInterval);
+    PromptHandler.runInterval = undefined;
+    // PromptHandler spies on ui.setModeInternal; re-spying an existing spy would recurse forever.
+    vi.restoreAllMocks();
+
+    this.game = new GameManager(this.phaserGame);
+    BattleScene.prototype.randBattleSeedInt = realRandBattleSeedInt;
+    this.installCaptureCounter();
+    this.installManualClock();
+    this.restoreBaseline();
+    this.manualClock = false; // the test framework's helpers below need the wall-clock interval
+    this.game.settings.battleStyle(BattleStyle.SET);
+    this.maxWave = opts.maxWave ?? Number.POSITIVE_INFINITY;
+    this.setDoubleChance(opts.doubleChance);
+    this.autoInputs = {};
+    this.lastSession = undefined;
+    // The harness's ReloadHelper already replaces saveAll; keep a serialized copy of each wave-start
+    // save instead. Serialize now: the save data shares live objects (e.g. pokeballCounts) with the scene.
+    const gameData = this.scene.gameData;
+    vi.spyOn(gameData, "saveAll").mockImplementation(async () => {
+      this.lastSession = {
+        wave: this.scene.currentBattle.waveIndex,
+        session: JSON.stringify(gameData.getSessionSaveData()),
+      };
+      return true;
+    });
   }
 
   /**
@@ -1147,6 +1208,12 @@ function serve(sim: Sim, port: number): Promise<void> {
               break;
             case "step":
               send({ ok: true, ...(await sim.step(Number(req.action))) });
+              break;
+            case "snapshot":
+              send({ ok: true, ...sim.snapshot() });
+              break;
+            case "load":
+              send({ ok: true, ...(await sim.load(req)) });
               break;
             case "close":
               send({ ok: true });
