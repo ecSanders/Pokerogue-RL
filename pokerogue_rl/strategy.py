@@ -29,18 +29,21 @@ def carry_level(party: list[dict]) -> int:
 UNCATCHABLE_BOSS_EVERY = 50  # endless: every 50th wave is the End biome, where the boss can't be caught
 
 
-def gate_clears(runs: list[tuple[int, str]], every: int = UNCATCHABLE_BOSS_EVERY) -> dict[int, tuple[int, int]]:
+def gate_clears(runs: list[tuple], every: int = UNCATCHABLE_BOSS_EVERY) -> dict[int, tuple[int, int]]:
     """Per gate wave (every 50th: the uncatchable boss), (runs that cleared it, runs that reached it).
 
-    `runs` holds each run's final (wave, reason). A run reached gate g if it got past g or lost on g;
-    it cleared g if it got past it. A run cut off on g for another reason (decision_limit) counts for
-    neither. On "max_wave" the final wave is max_wave + 1, so a run capped at a gate cleared it.
+    `runs` holds each run's final (wave, reason), or (wave, reason, start wave) for runs that began
+    from a snapshot; a run only counts for gates after its start. A run reached gate g if it got past g
+    or lost on g; it cleared g if it got past it. A run cut off on g for another reason
+    (decision_limit) counts for neither. On "max_wave" the final wave is max_wave + 1, so a run capped
+    at a gate cleared it.
     """
     out: dict[int, tuple[int, int]] = {}
-    top = max((w for w, _ in runs), default=0)
+    runs = [(r[0], r[1], r[2] if len(r) > 2 else 1) for r in runs]
+    top = max((w for w, _, _ in runs), default=0)
     for g in range(every, top + 1, every):
-        cleared = sum(w > g for w, _ in runs)
-        lost = sum(w == g and r == "game_over" for w, r in runs)
+        cleared = sum(w > g and s < g for w, _, s in runs)
+        lost = sum(w == g and r == "game_over" and s < g for w, r, s in runs)
         if cleared + lost:
             out[g] = (cleared, cleared + lost)
     return out

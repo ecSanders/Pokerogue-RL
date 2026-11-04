@@ -36,6 +36,7 @@ from pokerogue_rl.policy import AgentPolicy  # noqa: E402
 from pokerogue_rl.run_features import RUN_KINDS, item_bucket  # noqa: E402
 from pokerogue_rl.strategy import LURES, gate_clears  # noqa: E402
 from pokerogue_rl.rollout import collect  # noqa: E402
+from pokerogue_rl.snapshots import SnapshotBank, parse_waves  # noqa: E402
 from pokerogue_rl.tracking import Tracker  # noqa: E402
 
 
@@ -103,6 +104,15 @@ def parse_args():
                    help="updates to wait for in-progress episodes to finish before a restart cuts them")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--save-every", type=int, default=10, help="updates between checkpoints")
+    p.add_argument("--snapshot-waves", help="start-wave curriculum (see pokerogue_rl/snapshots.py): bank wave-start "
+                   "snapshots from this range of waves, e.g. 20-45, and start some episodes from them")
+    p.add_argument("--snapshot-frac", type=float, default=0.5,
+                   help="fraction of new episodes started from a banked snapshot (once the bank has any)")
+    p.add_argument("--snapshot-collect", type=float, default=0.25,
+                   help="chance each wave start in --snapshot-waves is offered to the bank")
+    p.add_argument("--snapshot-capacity", type=int, default=64, help="snapshots kept per wave")
+    p.add_argument("--snapshot-seed-bank", nargs="*", default=[],
+                   help="saved banks (runs/NAME/snapshots*.pkl) to fill this run's bank from at the start")
     p.add_argument("--clearml", action="store_true",
                    help="track the run in ClearML (needs ~/clearml.conf): args, log charts, console, checkpoints")
     p.add_argument("--clearml-upload-every", type=int, default=200,
@@ -158,7 +168,15 @@ def main() -> None:
     actor = AgentPolicy()
     actor.load_state_dict(policy.state_dict())
 
-    envs = VecBattleEnv(args.num_envs, double_envs=args.double_envs, double_chance=args.double_chance,
+    # Start-wave curriculum: one bank per rank, shared by its envs, saved with the run for --resume.
+    bank, bank_file = None, out / (f"snapshots-r{dd.rank}.pkl" if dd.enabled else "snapshots.pkl")
+    if args.snapshot_waves:
+        bank = SnapshotBank(parse_waves(args.snapshot_waves), capacity=args.snapshot_capacity, seed=dd.rank)
+        for path in ([bank_file] if args.resume and bank_file.exists() else []) + [Path(p) for p in args.snapshot_seed_bank]:
+            print(f"{'rank ' + str(dd.rank) + ': ' if dd.enabled else ''}snapshot bank: "
+                  f"{bank.load(path)} snapshots from {path}", flush=True)
+    envs = VecBattleEnv(args.num_envs, bank=bank, snapshot_frac=args.snapshot_frac,
+                        snapshot_collect=args.snapshot_collect, double_envs=args.double_envs, double_chance=args.double_chance,
                         seed_prefix=f"{args.name}-r{dd.rank}" if dd.enabled else args.name, max_wave=args.max_wave,
                         reward=RewardConfig(gamma=args.gamma, wave_reward=args.wave_reward, team_coef=args.team_coef,
                                             damage_coef=args.damage_coef, exp_coef=args.exp_coef,
@@ -172,7 +190,8 @@ def main() -> None:
     n, t_len = args.num_envs, args.rollout
     batch_size = n * t_len  # this rank's
     num_updates = args.total_steps // (batch_size * dd.world)
-    recent = collections.deque(maxlen=100)  # finished episodes
+    recent = collections.deque(maxlen=100)  # finished episodes that started at wave 1
+    recent_snap = collections.deque(maxlen=100)  # finished episodes that started from a banked snapshot
     start = time.time()
 
     try:
@@ -185,7 +204,9 @@ def main() -> None:
             rollout_time = time.time() - rollout_start
             parts = dd.gather((rollout.episodes, rollout.invalid, rollout.sim_errors, rollout_time))
             for eps, _, _, _ in parts:
-                recent.extend(eps)
+                for e in eps:
+                    (recent_snap if e.get("start_wave", 1) > 1 else recent).append(e)
+            bank_sizes = dd.gather((len(bank), bank.waves_held()) if bank is not None else (0, 0))
             invalid, sim_errors = sum(p[1] for p in parts), sum(p[2] for p in parts)
             rollout_time = max(p[3] for p in parts)
             global_step += batch_size * dd.world
@@ -258,6 +279,16 @@ def main() -> None:
                 # reached it, and how many reached it: mean wave hides that one boss decides the run.
                 **{k: v for g, (c, n) in gate_clears([(e["wave"], e["reason"]) for e in recent]).items()
                    for k, v in ((f"gate{g}", round(c / n, 3)), (f"gate{g}_n", n))},
+                # Curriculum: the bank (summed over ranks) and episodes started from it. The stats above
+                # cover only episodes from wave 1, so they stay comparable with runs without a curriculum.
+                **({"bank": sum(b[0] for b in bank_sizes), "bank_waves": max(b[1] for b in bank_sizes),
+                    "snap_episodes": len(recent_snap),
+                    "snap_waves_gained": round(float(np.mean([e["wave"] - e["start_wave"] for e in recent_snap])), 2)
+                    if recent_snap else None,
+                    **{k: v for g, (c, n) in gate_clears([(e["wave"], e["reason"], e["start_wave"])
+                                                           for e in recent_snap]).items()
+                       for k, v in ((f"snap_gate{g}", round(c / n, 3)), (f"snap_gate{g}_n", n))}}
+                   if bank is not None else {}),
                 "invalid": invalid,
                 "sim_errors": sim_errors,
                 "run_frac": round(run_frac, 3),
@@ -274,6 +305,8 @@ def main() -> None:
                 torch.save({"policy": policy.state_dict(), "optimizer": optimizer.state_dict(), "update": update,
                             "step": global_step, "args": vars(args)}, out / "policy.pt.tmp")
                 (out / "policy.pt.tmp").replace(out / "policy.pt")
+            if bank is not None and update % (10 * args.save_every) == 0:
+                bank.save(bank_file)  # every rank its own; tens of MB, so less often than the checkpoint
                 tracker.checkpoint(out / "policy.pt", update, final=update == num_updates)
             if update % args.recycle_every == 0 and update < num_updates and not envs.draining:
                 envs.start_drain()
@@ -285,6 +318,8 @@ def main() -> None:
     finally:
         # Also on Ctrl-C or SIGTERM (Slurm requeue), or the simulator processes outlive the trainer.
         envs.close()
+        if bank is not None:
+            bank.save(bank_file)
         dd.close()
         tracker.close()
 

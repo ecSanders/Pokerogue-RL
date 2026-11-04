@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import itertools
 import pickle
+import random
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
@@ -55,6 +56,7 @@ from pokerogue_rl.agents.heuristic import HeuristicAgent
 from pokerogue_rl.features import BALL_ACTION, BATTLE_KINDS, boss_on_field
 from pokerogue_rl.run_features import TmMemory
 from pokerogue_rl.sim_client import SimClient, SimError, launch_sims
+from pokerogue_rl.snapshots import SnapshotBank
 from pokerogue_rl.strategy import LURES, UNCATCHABLE_BOSS_EVERY, StrategyTracker, boss_gap, carry_level, pokerus_count
 
 
@@ -118,9 +120,17 @@ def enemy_health(obs: dict) -> float:
 class BattleEnv:
     def __init__(self, env_id: int, seed_prefix: str = "train", max_wave: int = 500,
                  reward: RewardConfig | None = None, sim: SimClient | None = None,
-                 policy_kinds: tuple[str, ...] = BATTLE_KINDS, double_chance: float | None = None):
+                 policy_kinds: tuple[str, ...] = BATTLE_KINDS, double_chance: float | None = None,
+                 bank: SnapshotBank | None = None, snapshot_frac: float = 0.0, snapshot_collect: float = 1.0):
         """`sim`: a client from a shared simulator group; launches its own simulator if omitted.
-        `double_chance`: more double battles for practice (see SimClient.reset)."""
+        `double_chance`: more double battles for practice (see SimClient.reset).
+        `bank`: start-wave curriculum (see snapshots.py). Each wave start in the bank's range is offered
+        to it with probability `snapshot_collect`, and each new episode starts from a banked snapshot
+        with probability `snapshot_frac` (once the bank has any)."""
+        self.bank = bank
+        self.snapshot_frac = snapshot_frac
+        self.snapshot_collect = snapshot_collect
+        self.rng = random.Random(f"{seed_prefix}-{env_id}")
         self.double_chance = double_chance
         self.in_double = False  # last command was in a double battle
         self.exp_streak_uid: int | None = None
@@ -175,6 +185,11 @@ class BattleEnv:
         self.sim = SimClient.launch(request_timeout=120)
 
     def reset(self) -> dict:
+        if self.bank is not None and self.snapshot_frac and self.rng.random() < self.snapshot_frac:
+            snap = self.bank.sample(self.rng)
+            if snap is not None:
+                # Re-seeded: a new game from the snapshot's wave on, not a replay of the one it came from.
+                return self.reset_from(snap, seed=next(self.seeds))
         try:
             return self._reset()
         except (SimError, OSError) as e:  # socket.timeout is an OSError
@@ -228,12 +243,12 @@ class BattleEnv:
         try:
             resp = self.sim.load(snap["session"], seed=seed, max_wave=self.max_wave,
                                  double_chance=self.double_chance)
+            for k, v in pickle.loads(snap["state"]).items():
+                setattr(self, k, v)
+            resp = self._play_until_policy(resp)
         except (SimError, OSError) as e:
             self._restart_sim(e)
             return self._reset()
-        for k, v in pickle.loads(snap["state"]).items():
-            setattr(self, k, v)
-        resp = self._play_until_policy(resp)
         if resp["done"]:
             return self._reset()
         return self._start_episode(resp)
@@ -297,6 +312,14 @@ class BattleEnv:
         else:
             self.obs = obs
             self.at_wave_start = obs["wave"] != prev["wave"] and self._clean_wave_start
+            if (self.at_wave_start and self.bank is not None and self.bank.wants(obs["wave"])
+                    and self.rng.random() < self.snapshot_collect):
+                try:
+                    snap = self.snapshot()
+                except (SimError, OSError):
+                    snap = None  # a broken simulator shows up, and is replaced, on the next step
+                if snap is not None:
+                    self.bank.add(snap)
         return obs, reward, done, info
 
     def _exp_reward(self, prev: list[dict], nxt: list[dict], carry_bonus: float) -> float:
