@@ -34,7 +34,7 @@ from pokerogue_rl.install_sim import install_sim  # noqa: E402
 from pokerogue_rl.features import BATTLE_KINDS  # noqa: E402
 from pokerogue_rl.policy import AgentPolicy  # noqa: E402
 from pokerogue_rl.run_features import RUN_KINDS, item_bucket  # noqa: E402
-from pokerogue_rl.strategy import LURES  # noqa: E402
+from pokerogue_rl.strategy import LURES, gate_clears  # noqa: E402
 from pokerogue_rl.rollout import collect  # noqa: E402
 
 
@@ -246,6 +246,10 @@ def main() -> None:
                    for k in ("double_frac", "pickup_frac", "lures", "ball_frac", "carry_gap", "pokerus")},
                 "boss_gap": round(float(np.mean(g)), 2) if (g := [e["boss_gap"] for e in recent
                                                                   if e.get("boss_gap") is not None]) else None,
+                # Clear rate at each uncatchable-boss gate (every 50th wave) among recent episodes that
+                # reached it, and how many reached it: mean wave hides that one boss decides the run.
+                **{k: v for g, (c, n) in gate_clears([(e["wave"], e["reason"]) for e in recent]).items()
+                   for k, v in ((f"gate{g}", round(c / n, 3)), (f"gate{g}_n", n))},
                 "invalid": invalid,
                 "sim_errors": sim_errors,
                 "run_frac": round(run_frac, 3),

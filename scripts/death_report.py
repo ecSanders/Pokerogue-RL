@@ -2,6 +2,7 @@
 
 Usage:
   python scripts/death_report.py --agent heuristic --episodes 96 --workers 12
+  python scripts/death_report.py --from runs/deaths.jsonl      # summarise saved records again
 Writes one JSON record per run to runs/deaths.jsonl and prints a summary.
 """
 
@@ -19,7 +20,7 @@ sys.path.insert(0, str(ROOT))
 
 from pokerogue_rl.agents import AGENTS  # noqa: E402
 from pokerogue_rl.sim_client import SimClient, launch_sims  # noqa: E402
-from pokerogue_rl.strategy import StrategyTracker  # noqa: E402
+from pokerogue_rl.strategy import StrategyTracker, gate_clears  # noqa: E402
 
 
 def team_summary(party: list[dict]) -> dict:
@@ -104,6 +105,11 @@ def summarize(records: list[dict]) -> None:
     deaths = [r for r in records if r["reason"] == "game_over"]
     n = len(deaths)
     print(f"\n=== {len(records)} runs, {n} ended in game over ===")
+    gates = gate_clears([(r["wave"], r["reason"]) for r in records])
+    if gates:
+        print("uncatchable-boss gates (every 50th wave), cleared / reached:")
+        for g, (c, reached) in gates.items():
+            print(f"  wave {g}: {pct(c, reached)}")
     if not n:
         return
     waves = sorted(r["wave"] for r in deaths)
@@ -179,7 +185,12 @@ def main() -> None:
     parser.add_argument("--max-wave", type=int, default=500)
     parser.add_argument("--seed", default="death")
     parser.add_argument("--out", default=str(ROOT / "runs" / "deaths.jsonl"))
+    parser.add_argument("--from", dest="from_file", help="summarise records saved by an earlier run instead of playing")
     args = parser.parse_args()
+    if args.from_file:
+        with open(args.from_file) as f:
+            summarize([json.loads(line) for line in f if line.strip()])
+        return
 
     jobs: queue.Queue = queue.Queue()
     for ep in range(args.episodes):
