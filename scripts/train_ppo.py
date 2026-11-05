@@ -62,6 +62,11 @@ def parse_args():
     p.add_argument("--faint-cost", type=float, default=0.0,
                    help="cost per party member fainting, times the number of team members fainted counting it "
                         "(everyone still standing faints at game over)")
+    p.add_argument("--faint-gameover", type=float, default=None,
+                   help="flat cost for losing the run, replacing --faint-cost's game-over wipe (which costs more "
+                        "the bigger the team); mid-run faints still escalate")
+    p.add_argument("--alive-coef", type=float, default=0.0,
+                   help="reward per wave cleared, times the party members not fainted / 6")
     p.add_argument("--level-coef", type=float, default=0.0,
                    help="reward shaping per party level gained (see env.py)")
     p.add_argument("--carry-coef", type=float, default=0.0,
@@ -184,7 +189,8 @@ def main() -> None:
                                             level_coef=args.level_coef, carry_coef=args.carry_coef,
                                             pokerus_coef=args.pokerus_coef, boss_coef=args.boss_coef,
                                             ball_cost=args.ball_cost, double_coef=args.double_coef,
-                                            lure_bonus=args.lure_bonus),
+                                            lure_bonus=args.lure_bonus, faint_gameover=args.faint_gameover,
+                                            alive_coef=args.alive_coef),
                         policy_kinds=BATTLE_KINDS + (RUN_KINDS if args.run_policy else ()))
     envs.reset()
     n, t_len = args.num_envs, args.rollout

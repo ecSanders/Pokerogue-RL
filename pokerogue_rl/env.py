@@ -18,10 +18,18 @@ Reward per policy step:
       steps whose largest gainer was that same Pokemon (resets when another Pokemon is the largest)
   - FAINT_COST * k for each party member fainting, k = team members fainted counting it (1, 2, 3, ...;
       everyone still standing faints at game over)
+  - FAINT_GAMEOVER instead of that, at game over, if set: a flat cost for losing the run
+  + ALIVE_COEF * (party members not fainted) / 6 per wave cleared   (keep a healthy bench)
 The EXP and faint terms are the minimal-shaping alternative (exp-v1, 2026-11-03): run with
 --wave-reward 0 --team-coef 0 --damage-coef 0 and nothing else. The agent is paid only for EXP, more
 for feeding it to the same Pokemon (the carry) step after step, and pays for losing Pokemon; surviving longer is how it
 earns more EXP. Levels, not raw EXP points, since EXP per level grows roughly cubically.
+Team size under exp-v1: every run ends in game over, where everyone standing faints, so a team of n
+pays FAINT_COST * n(n+1)/2 in all (3: 0.6, 6: 2.1 at 0.1) and catches earn no EXP. exp-v1 learned to
+never catch and plateaued near wave 20 with its starters. --faint-gameover makes losing the run cost
+the same whatever the team size (mid-run faints still escalate), and --alive-coef pays per wave for
+members still standing, a bench kept alive rather than slots filled (paid per wave, not per catch, so
+catch-and-release can't farm it).
 team_health = sum of party HP fractions / 6, so fainted members count 0; 0 at game over.
 Level shaping rewards EXP: without it, catching (no EXP) clears wild waves as well as a KO does, and
 the under-levelled team then dies to the wave-50 boss, beyond the discount horizon. Both level terms
@@ -76,6 +84,8 @@ class RewardConfig:
     exp_coef: float = 0.0
     exp_carry_bonus: float = 0.0
     faint_cost: float = 0.0
+    faint_gameover: float | None = None  # flat cost at game over instead of the escalating wipe
+    alive_coef: float = 0.0
 
 
 def team_health(obs: dict) -> float:
@@ -274,8 +284,13 @@ class BattleEnv:
         reward += cfg.team_coef * (cfg.gamma * next_health - team_health(prev))
         if cfg.exp_coef:
             reward += cfg.exp_coef * self._exp_reward(prev["party"], obs["party"], cfg.exp_carry_bonus)
-        if cfg.faint_cost:
+        if game_over and cfg.faint_gameover is not None:
+            reward -= cfg.faint_gameover
+        elif cfg.faint_cost:
             reward -= cfg.faint_cost * faint_penalty(prev, obs, game_over)
+        if cfg.alive_coef and obs["wave"] > prev["wave"]:
+            alive = sum(not p["fainted"] for p in obs["party"])
+            reward += cfg.alive_coef * (obs["wave"] - prev["wave"]) * alive / 6
         if cfg.level_coef:
             reward += cfg.level_coef * exp_levels(prev["party"], obs["party"])
         if cfg.carry_coef:
