@@ -141,9 +141,6 @@ def main() -> None:
         (out / "config.json").write_text(json.dumps({**vars(args), "world_size": dd.world}, indent=2))
         install_sim()  # once, before the other ranks' simulators read the shared checkout
     dd.barrier()
-    # Rank 0 only: the other ranks' episodes reach it through dd.gather.
-    tracker = Tracker(args.clearml and dd.main, args.name, out, {**vars(args), "world_size": dd.world},
-                      resume=args.resume, upload_every=args.clearml_upload_every)
 
     policy = AgentPolicy().to(device)
     optimizer = torch.optim.Adam(policy.parameters(), lr=args.lr, eps=1e-5)
@@ -168,6 +165,13 @@ def main() -> None:
             for item in LURES:
                 policy.run.item_bias.weight[item_bucket(item)] = args.lure_prior
     dd.broadcast_params(policy)
+
+    # Rank 0 only: the other ranks' episodes reach it through dd.gather. Started after the model and
+    # optimizer: Task.init hooks every import and starts a monitor process and a git scan, and rank 0 of
+    # exp-coef-v1 (job 1384) hung for 10+ minutes in the Adam constructor's import of torch._dynamo /
+    # sympy under those hooks, holding the other rank at the weight broadcast.
+    tracker = Tracker(args.clearml and dd.main, args.name, out, {**vars(args), "world_size": dd.world},
+                      resume=args.resume, upload_every=args.clearml_upload_every)
 
     # Rollouts run per-env threads with small-batch inference on a CPU copy (faster than GPU there).
     actor = AgentPolicy()
