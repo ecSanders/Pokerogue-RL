@@ -10,6 +10,8 @@
 # covers N times the steps.
 #
 # Extra sbatch flags go in SBATCH_EXTRA, e.g. SBATCH_EXTRA="--time=4:00:00" hpc/submit.sh ...
+# MAX_CONCURRENT=K limits a sweep to K tasks running at once (shared cluster), e.g.
+#   MAX_CONCURRENT=2 hpc/submit.sh --nodes 2 --sweep FILE
 # Jobs resume from runs/NAME/policy.pt when it exists, so resubmitting a name continues that run.
 set -euo pipefail
 
@@ -44,7 +46,7 @@ if [[ "${1:-}" == "--sweep" ]]; then
     n="$(wc -l < "$frozen")"
     (( n > 0 )) || { echo "no runs in $file" >&2; exit 1; }
     echo "Sweep of $n runs from $file (frozen copy: $frozen)"
-    sbatch "${flags[@]}" --job-name="sweep-$(basename "$file" .txt)" --array="0-$((n - 1))" \
+    sbatch "${flags[@]}" --job-name="sweep-$(basename "$file" .txt)" --array="0-$((n - 1))${MAX_CONCURRENT:+%$MAX_CONCURRENT}" \
         --output="logs/slurm/%x-%A_%a.out" --export=ALL,SWEEP_FILE="$ROOT/$frozen" hpc/job.sh
 else
     name="${1:?usage: hpc/submit.sh NAME [train_ppo.py args...]}"

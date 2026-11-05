@@ -1,0 +1,14 @@
+# exp-v1 ablation: each reward change alone, then all together, against the exp-v1 baseline.
+# exp-v1 (2 nodes, 10M steps, from scratch) plateaued near wave 20 with entropy ~0.15 and never caught a
+# Pokemon: every member standing faints at game over, so a team of n pays 0.1 * n(n+1)/2 (3: 0.6, 6: 2.1)
+# and catches earn no EXP. Every run below is exp-v1's exact setup plus its change(s), so they compare
+# directly with runs/exp-v1. Submit with: MAX_CONCURRENT=2 hpc/submit.sh --nodes 2 --sweep hpc/sweeps/exp-v1-ablation.txt
+#   exp-coef-v1   --ent-coef 0.03 (was 0.01): keep exploring (balls, lures, switches)
+#   exp-go-v1     --faint-gameover 1.0: losing the run costs the same whatever the team size
+#   exp-alive-v1  --alive-coef 0.05: per wave cleared, 0.05 * (members not fainted) / 6
+#   exp-all-v1    all three
+
+exp-coef-v1   --run-policy --total-steps 10000000 --max-wave 500 --wave-reward 0 --team-coef 0 --damage-coef 0 --exp-coef 0.1 --exp-carry-bonus 1.0 --faint-cost 0.1 --clearml --ent-coef 0.03
+exp-go-v1     --run-policy --total-steps 10000000 --max-wave 500 --wave-reward 0 --team-coef 0 --damage-coef 0 --exp-coef 0.1 --exp-carry-bonus 1.0 --faint-cost 0.1 --clearml --faint-gameover 1.0
+exp-alive-v1  --run-policy --total-steps 10000000 --max-wave 500 --wave-reward 0 --team-coef 0 --damage-coef 0 --exp-coef 0.1 --exp-carry-bonus 1.0 --faint-cost 0.1 --clearml --alive-coef 0.05
+exp-all-v1    --run-policy --total-steps 10000000 --max-wave 500 --wave-reward 0 --team-coef 0 --damage-coef 0 --exp-coef 0.1 --exp-carry-bonus 1.0 --faint-cost 0.1 --clearml --ent-coef 0.03 --faint-gameover 1.0 --alive-coef 0.05
