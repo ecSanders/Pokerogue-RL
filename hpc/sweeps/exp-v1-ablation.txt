@@ -1,10 +1,11 @@
 # exp-v1 follow-ups: the snapshot curriculum against a control, and each reward change alone and combined.
 #
-# Single-node jobs, at most 2 at a time (cluster admin, 2026-11-05: one node per job, up to 2 nodes per user).
-# exp-v1 ran on 2 nodes x 12 envs; one node with 24 envs collects the same 3072 steps per update, so
-# the PPO hyperparameters are the same and these compare directly with runs/exp-v1. 24 envs need ~28 CPUs and
-# ~40 GB, which only bowser and chungus have. Submit after exp-v1 (job 1365) finishes:
-#   SBATCH_EXTRA="--cpus-per-task=28 --mem=52G --exclude=adrian --dependency=afterok:1365" \
+# Cluster policy (2026-11-05): one node per job, no distributed training, at most 2 nodes per user, and
+# leave bowser free (its GPUs are for others); nodes talk over 1 Gbps ethernet. exp-v1 ran on 2 nodes x 12
+# envs x 128 steps = 3072 steps per update; here one node runs 20 envs x 154 steps = 3080 (4 minibatches of
+# 770), so the PPO settings match within 0.3%. 20 envs need 24 CPUs and ~44 GB: ryu, zengief, frutiger or
+# chungus. Submit after exp-v1 (job 1365) finishes:
+#   SBATCH_EXTRA="--cpus-per-task=24 --mem=44G --exclude=adrian,bowser --dependency=afterok:1365" \
 #     MAX_CONCURRENT=2 hpc/submit.sh --sweep hpc/sweeps/exp-v1-ablation.txt
 # Pairs run side by side in this order.
 #
@@ -19,9 +20,9 @@
 #   exp-alive-v1  --alive-coef 0.05: per wave cleared, 0.05 * (members not fainted) / 6
 #   exp-all-v1    all three
 
-exp-v1-curr   --num-envs 24 --run-policy --total-steps 10000000 --max-wave 500 --wave-reward 0 --team-coef 0 --damage-coef 0 --exp-coef 0.1 --exp-carry-bonus 1.0 --faint-cost 0.1 --clearml --init runs/exp-v1/policy.pt --snapshot-waves 20-45
-exp-v1-ctrl   --num-envs 24 --run-policy --total-steps 10000000 --max-wave 500 --wave-reward 0 --team-coef 0 --damage-coef 0 --exp-coef 0.1 --exp-carry-bonus 1.0 --faint-cost 0.1 --clearml --init runs/exp-v1/policy.pt
-exp-coef-v1   --num-envs 24 --run-policy --total-steps 10000000 --max-wave 500 --wave-reward 0 --team-coef 0 --damage-coef 0 --exp-coef 0.1 --exp-carry-bonus 1.0 --faint-cost 0.1 --clearml --ent-coef 0.03
-exp-go-v1     --num-envs 24 --run-policy --total-steps 10000000 --max-wave 500 --wave-reward 0 --team-coef 0 --damage-coef 0 --exp-coef 0.1 --exp-carry-bonus 1.0 --faint-cost 0.1 --clearml --faint-gameover 1.0
-exp-alive-v1  --num-envs 24 --run-policy --total-steps 10000000 --max-wave 500 --wave-reward 0 --team-coef 0 --damage-coef 0 --exp-coef 0.1 --exp-carry-bonus 1.0 --faint-cost 0.1 --clearml --alive-coef 0.05
-exp-all-v1    --num-envs 24 --run-policy --total-steps 10000000 --max-wave 500 --wave-reward 0 --team-coef 0 --damage-coef 0 --exp-coef 0.1 --exp-carry-bonus 1.0 --faint-cost 0.1 --clearml --ent-coef 0.03 --faint-gameover 1.0 --alive-coef 0.05
+exp-v1-curr   --num-envs 20 --rollout 154 --run-policy --total-steps 10000000 --max-wave 500 --wave-reward 0 --team-coef 0 --damage-coef 0 --exp-coef 0.1 --exp-carry-bonus 1.0 --faint-cost 0.1 --clearml --init runs/exp-v1/policy.pt --snapshot-waves 20-45
+exp-v1-ctrl   --num-envs 20 --rollout 154 --run-policy --total-steps 10000000 --max-wave 500 --wave-reward 0 --team-coef 0 --damage-coef 0 --exp-coef 0.1 --exp-carry-bonus 1.0 --faint-cost 0.1 --clearml --init runs/exp-v1/policy.pt
+exp-coef-v1   --num-envs 20 --rollout 154 --run-policy --total-steps 10000000 --max-wave 500 --wave-reward 0 --team-coef 0 --damage-coef 0 --exp-coef 0.1 --exp-carry-bonus 1.0 --faint-cost 0.1 --clearml --ent-coef 0.03
+exp-go-v1     --num-envs 20 --rollout 154 --run-policy --total-steps 10000000 --max-wave 500 --wave-reward 0 --team-coef 0 --damage-coef 0 --exp-coef 0.1 --exp-carry-bonus 1.0 --faint-cost 0.1 --clearml --faint-gameover 1.0
+exp-alive-v1  --num-envs 20 --rollout 154 --run-policy --total-steps 10000000 --max-wave 500 --wave-reward 0 --team-coef 0 --damage-coef 0 --exp-coef 0.1 --exp-carry-bonus 1.0 --faint-cost 0.1 --clearml --alive-coef 0.05
+exp-all-v1    --num-envs 20 --rollout 154 --run-policy --total-steps 10000000 --max-wave 500 --wave-reward 0 --team-coef 0 --damage-coef 0 --exp-coef 0.1 --exp-carry-bonus 1.0 --faint-cost 0.1 --clearml --ent-coef 0.03 --faint-gameover 1.0 --alive-coef 0.05
