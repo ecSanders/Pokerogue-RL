@@ -71,6 +71,7 @@ Mystery encounters are disabled.
 | `pokerogue_rl/` | Python package: simulator client, environments, agents |
 | `scripts/` | Setup, smoke tests, benchmarks |
 | `pokerogue/` | PokeRogue, pinned as a submodule |
+| `docs/` | Notes, e.g. [`pokerogue-mechanics.md`](docs/pokerogue-mechanics.md): endless-mode rules (level cap, bosses, EXP) read from the source |
 
 ## Running a simulator by hand
 
