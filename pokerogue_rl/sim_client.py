@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import random
+import signal
 import socket
 import subprocess
 import time
@@ -60,8 +61,23 @@ class SimGroup:
 
 
 def launch_sims(n: int, log_path: str | os.PathLike | None = None,
-                request_timeout: float | None = None) -> SimGroup:
-    """Start one Vitest process running n simulators and connect a client to each."""
+                request_timeout: float | None = None, attempts: int = 3) -> SimGroup:
+    """Start one Vitest process running n simulators and connect a client to each.
+
+    A start occasionally fails (exp-alive-v1, job 1389_4: one of 20 simulators never accepted a
+    connection during a periodic restart, and the run died), so a failed start is cleaned up and
+    retried on fresh ports, up to `attempts` times."""
+    for attempt in range(1, attempts + 1):
+        try:
+            return _launch_sims_once(n, log_path, request_timeout)
+        except SimError as e:
+            if attempt == attempts:
+                raise
+            print(f"[sim] starting {n} simulators failed ({e}); retrying ({attempt}/{attempts - 1})", flush=True)
+    raise AssertionError("unreachable")
+
+
+def _launch_sims_once(n: int, log_path: str | os.PathLike | None, request_timeout: float | None) -> SimGroup:
     if not 1 <= n <= MAX_SIMS:
         raise ValueError(f"can host 1-{MAX_SIMS} simulators per process, got {n}")
     install_sim()
@@ -74,8 +90,25 @@ def launch_sims(n: int, log_path: str | os.PathLike | None = None,
         env={**os.environ, "RL_PORT": str(base), "RL_SIMS": str(n)},
         stdout=log,
         stderr=subprocess.STDOUT,
+        start_new_session=True,  # own process group, so a failed start can be killed whole (pnpm -> node)
     )
-    clients = [SimClient(base + i, proc=proc, request_timeout=request_timeout) for i in range(n)]
+    clients: list[SimClient] = []
+    try:
+        for i in range(n):
+            clients.append(SimClient(base + i, proc=proc, request_timeout=request_timeout))
+    except BaseException:
+        # Don't leave a half-started Vitest process (and its connected simulators) behind.
+        for client in clients:
+            client.sock.close()
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        try:
+            proc.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            pass
+        raise
     return SimGroup(proc, clients)
 
 
