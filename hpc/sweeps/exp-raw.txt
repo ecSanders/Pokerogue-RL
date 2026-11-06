@@ -1,0 +1,22 @@
+# Raw-EXP reward, 2 x 2: fixed scale (--exp-raw-scale 250) x reward normalization (--reward-norm).
+#
+# exp-v1 pays 0.1 per level gained. Levels per wave stay ~0.7-1.4 all run, while raw EXP per wave grows
+# ~20x from the early waves to waves 31-45 (measured with exp-v1's policy), so raw EXP makes later waves
+# worth far more. A scale of 250 EXP points per unit matches the level-based reward over waves 10-20.
+# Unscaled, rewards are ~100-1000x larger and the critic's loss explodes (v_loss ~56 vs ~0.04 in a smoke
+# test); --reward-norm divides training rewards by the running std of the discounted return.
+# Everything else is exp-v1's setup (from scratch, 10M steps), on one node: 20 envs x 154 steps = 3080
+# steps per update (exp-v1: 3072). Compare on wave_mean and gate50, not return_mean or v_loss (different
+# reward scales). Submit (single-node jobs, at most 2 at a time, not on bowser):
+#   SBATCH_EXTRA="--cpus-per-task=24 --mem=44G --exclude=adrian,bowser" \
+#     MAX_CONCURRENT=2 hpc/submit.sh --sweep hpc/sweeps/exp-raw.txt
+#
+#   exp-raw-v1        raw EXP, no scale, no normalization
+#   exp-raw-both-v1   scale 250 + normalization
+#   exp-raw-scale-v1  scale 250 only
+#   exp-raw-norm-v1   normalization only
+
+exp-raw-v1        --num-envs 20 --rollout 154 --run-policy --total-steps 10000000 --max-wave 500 --wave-reward 0 --team-coef 0 --damage-coef 0 --exp-coef 0.1 --exp-carry-bonus 1.0 --faint-cost 0.1 --clearml --exp-unit raw
+exp-raw-both-v1   --num-envs 20 --rollout 154 --run-policy --total-steps 10000000 --max-wave 500 --wave-reward 0 --team-coef 0 --damage-coef 0 --exp-coef 0.1 --exp-carry-bonus 1.0 --faint-cost 0.1 --clearml --exp-unit raw --exp-raw-scale 250 --reward-norm
+exp-raw-scale-v1  --num-envs 20 --rollout 154 --run-policy --total-steps 10000000 --max-wave 500 --wave-reward 0 --team-coef 0 --damage-coef 0 --exp-coef 0.1 --exp-carry-bonus 1.0 --faint-cost 0.1 --clearml --exp-unit raw --exp-raw-scale 250
+exp-raw-norm-v1   --num-envs 20 --rollout 154 --run-policy --total-steps 10000000 --max-wave 500 --wave-reward 0 --team-coef 0 --damage-coef 0 --exp-coef 0.1 --exp-carry-bonus 1.0 --faint-cost 0.1 --clearml --exp-unit raw --reward-norm

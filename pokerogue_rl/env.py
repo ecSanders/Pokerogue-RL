@@ -20,6 +20,10 @@ Reward per policy step:
       everyone still standing faints at game over)
   - FAINT_GAMEOVER instead of that, at game over, if set: a flat cost for losing the run
   + ALIVE_COEF * (party members not fainted) / 6 per wave cleared   (keep a healthy bench)
+EXP_UNIT "raw" (--exp-unit raw) pays EXP_COEF per EXP_RAW_SCALE raw EXP points instead of per level.
+Measured with exp-v1 (2026-11-06): levels gained per wave stay ~0.7-1.4 all run, while raw EXP per wave
+grows from ~90 (waves 1-9) to ~340 (10-20), ~910 (21-30) and ~1800 (31-45); a scale of ~250 matches the
+level-based reward over waves 10-20 and makes waves 31-45 pay ~5x as much.
 The EXP and faint terms are the minimal-shaping alternative (exp-v1, 2026-11-03): run with
 --wave-reward 0 --team-coef 0 --damage-coef 0 and nothing else. The agent is paid only for EXP, more
 for feeding it to the same Pokemon (the carry) step after step, and pays for losing Pokemon; surviving longer is how it
@@ -86,6 +90,9 @@ class RewardConfig:
     faint_cost: float = 0.0
     faint_gameover: float | None = None  # flat cost at game over instead of the escalating wipe
     alive_coef: float = 0.0
+    # EXP_COEF's unit: "level" (levels incl. progress to the next) or "raw" (EXP points / EXP_RAW_SCALE).
+    exp_unit: str = "level"
+    exp_raw_scale: float = 1.0
 
 
 def team_health(obs: dict) -> float:
@@ -111,6 +118,18 @@ EXP_STREAK_CAP = 10  # consecutive EXP steps to the same Pokemon until the full 
 def exp_progress(p: dict) -> float:
     """Level plus progress toward the next one (expFrac; older simulators lack it)."""
     return p["level"] + p.get("expFrac", 0.0)
+
+
+def exp_measure(cfg: "RewardConfig"):
+    """The per-Pokemon EXP quantity whose gains EXP_COEF pays for: levels, or raw EXP points / scale.
+
+    Raw: EXP per level grows ~quadratically with level while EXP per battle grows ~linearly with the
+    wave, so level-based EXP pays ~1/wave per wave and raw EXP pays more the further the run gets."""
+    if cfg.exp_unit == "level":
+        return exp_progress
+    if cfg.exp_unit == "raw":
+        return lambda p: p["exp"] / cfg.exp_raw_scale
+    raise ValueError(f"unknown exp_unit {cfg.exp_unit!r}")
 
 
 def faint_penalty(prev: dict, obs: dict, game_over: bool) -> int:
@@ -283,7 +302,8 @@ class BattleEnv:
         next_health = 0.0 if game_over else team_health(obs)
         reward += cfg.team_coef * (cfg.gamma * next_health - team_health(prev))
         if cfg.exp_coef:
-            reward += cfg.exp_coef * self._exp_reward(prev["party"], obs["party"], cfg.exp_carry_bonus)
+            reward += cfg.exp_coef * self._exp_reward(prev["party"], obs["party"], cfg.exp_carry_bonus,
+                                                      exp_measure(cfg))
         if game_over and cfg.faint_gameover is not None:
             reward -= cfg.faint_gameover
         elif cfg.faint_cost:
@@ -337,13 +357,13 @@ class BattleEnv:
                     self.bank.add(snap)
         return obs, reward, done, info
 
-    def _exp_reward(self, prev: list[dict], nxt: list[dict], carry_bonus: float) -> float:
+    def _exp_reward(self, prev: list[dict], nxt: list[dict], carry_bonus: float, measure=exp_progress) -> float:
         """Levels gained (with partial progress) by Pokemon on the team before and after. The largest
         gainer of the step is the recipient; consecutive steps with the same recipient build a streak,
         and its gain is weighted 1 + carry_bonus * min(streak - 1, EXP_STREAK_CAP) / EXP_STREAK_CAP.
         Other gainers are paid x1 and don't break the streak."""
-        before = {p["uid"]: exp_progress(p) for p in prev}
-        gains = {p["uid"]: max(0.0, exp_progress(p) - before[p["uid"]]) for p in nxt if p["uid"] in before}
+        before = {p["uid"]: measure(p) for p in prev}
+        gains = {p["uid"]: max(0.0, measure(p) - before[p["uid"]]) for p in nxt if p["uid"] in before}
         gains = {uid: g for uid, g in gains.items() if g > 0}
         if not gains:
             return 0.0

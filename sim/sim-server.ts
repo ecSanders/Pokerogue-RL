@@ -1091,6 +1091,7 @@ class Sim {
       pokerus: p.pokerus,
       level: p.level,
       expFrac: this.expFrac(p),
+      exp: p.exp, // total EXP points (for raw-EXP rewards; not a policy feature)
       hp: p.hp,
       maxHp: p.getMaxHp(),
       stats: [0, 1, 2, 3, 4, 5].map(s => p.getStat(s)),

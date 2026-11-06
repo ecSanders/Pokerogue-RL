@@ -35,6 +35,7 @@ from pokerogue_rl.features import BATTLE_KINDS  # noqa: E402
 from pokerogue_rl.policy import AgentPolicy  # noqa: E402
 from pokerogue_rl.run_features import RUN_KINDS, item_bucket  # noqa: E402
 from pokerogue_rl.strategy import LURES, gate_clears  # noqa: E402
+from pokerogue_rl.reward_norm import RewardNormalizer  # noqa: E402
 from pokerogue_rl.rollout import collect  # noqa: E402
 from pokerogue_rl.snapshots import SnapshotBank, parse_waves  # noqa: E402
 from pokerogue_rl.tracking import Tracker  # noqa: E402
@@ -65,6 +66,13 @@ def parse_args():
     p.add_argument("--faint-gameover", type=float, default=None,
                    help="flat cost for losing the run, replacing --faint-cost's game-over wipe (which costs more "
                         "the bigger the team); mid-run faints still escalate")
+    p.add_argument("--exp-unit", choices=["level", "raw"], default="level",
+                   help="what --exp-coef pays for: levels gained (incl. progress to the next), or raw EXP points "
+                        "/ --exp-raw-scale (raw EXP per battle grows with the wave; per level it shrinks)")
+    p.add_argument("--exp-raw-scale", type=float, default=1.0, help="EXP points per unit for --exp-unit raw")
+    p.add_argument("--reward-norm", action="store_true",
+                   help="divide training rewards by the running std of the discounted return "
+                        "(pokerogue_rl/reward_norm.py); logged returns stay unscaled")
     p.add_argument("--alive-coef", type=float, default=0.0,
                    help="reward per wave cleared, times the party members not fainted / 6")
     p.add_argument("--level-coef", type=float, default=0.0,
@@ -145,10 +153,12 @@ def main() -> None:
     policy = AgentPolicy().to(device)
     optimizer = torch.optim.Adam(policy.parameters(), lr=args.lr, eps=1e-5)
     first_update, global_step = 1, 0
+    reward_norm_state = None
     if args.resume:
         ckpt = policy.load_checkpoint(out / "policy.pt", map_location=device)
         optimizer.load_state_dict(ckpt["optimizer"])
         first_update, global_step = ckpt["update"] + 1, ckpt["step"]
+        reward_norm_state = ckpt.get("reward_norm")
         # Drop log rows written after the checkpoint; those updates are redone.
         log = out / "log.jsonl"
         if dd.main and log.exists():
@@ -194,12 +204,16 @@ def main() -> None:
                                             pokerus_coef=args.pokerus_coef, boss_coef=args.boss_coef,
                                             ball_cost=args.ball_cost, double_coef=args.double_coef,
                                             lure_bonus=args.lure_bonus, faint_gameover=args.faint_gameover,
-                                            alive_coef=args.alive_coef),
+                                            alive_coef=args.alive_coef, exp_unit=args.exp_unit,
+                                            exp_raw_scale=args.exp_raw_scale),
                         policy_kinds=BATTLE_KINDS + (RUN_KINDS if args.run_policy else ()))
     envs.reset()
     n, t_len = args.num_envs, args.rollout
     batch_size = n * t_len  # this rank's
     num_updates = args.total_steps // (batch_size * dd.world)
+    reward_norm = RewardNormalizer(n, args.gamma) if args.reward_norm else None
+    if reward_norm and reward_norm_state:
+        reward_norm.load_state_dict(reward_norm_state)
     recent = collections.deque(maxlen=100)  # finished episodes that started at wave 1
     recent_snap = collections.deque(maxlen=100)  # finished episodes that started from a banked snapshot
     start = time.time()
@@ -223,7 +237,8 @@ def main() -> None:
 
             # GAE. Episodes end inside the rollout (done=1 cuts bootstrapping); bootstrap the tail.
             to_dev = lambda a: torch.as_tensor(a, device=device)  # noqa: E731
-            values_t, rewards_t, dones_t = to_dev(rollout.values), to_dev(rollout.rewards), to_dev(rollout.dones)
+            rewards = reward_norm(rollout.rewards, rollout.dones) if reward_norm else rollout.rewards
+            values_t, rewards_t, dones_t = to_dev(rollout.values), to_dev(rewards), to_dev(rollout.dones)
             next_value = to_dev(rollout.next_values)
             advantages = torch.zeros_like(rewards_t)
             last = torch.zeros(n, device=device)
@@ -302,6 +317,7 @@ def main() -> None:
                 "invalid": invalid,
                 "sim_errors": sim_errors,
                 "run_frac": round(run_frac, 3),
+                **({"reward_std": round(reward_norm.std, 4)} if reward_norm else {}),
                 **{k: round(float(np.mean(v)), 4) for k, v in stats.items()},
             }
             if dd.main:
@@ -313,6 +329,7 @@ def main() -> None:
             if dd.main and (update % args.save_every == 0 or update == num_updates):
                 # Write then rename, so a job killed mid-save (e.g. Slurm preemption) keeps the last good checkpoint.
                 torch.save({"policy": policy.state_dict(), "optimizer": optimizer.state_dict(), "update": update,
+                            **({"reward_norm": reward_norm.state_dict()} if reward_norm else {}),
                             "step": global_step, "args": vars(args)}, out / "policy.pt.tmp")
                 (out / "policy.pt.tmp").replace(out / "policy.pt")
             if bank is not None and update % (10 * args.save_every) == 0:
