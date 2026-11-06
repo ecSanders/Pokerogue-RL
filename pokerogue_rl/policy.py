@@ -10,8 +10,25 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from pokerogue_rl import extra_features as XF
 from pokerogue_rl import features as F
 from pokerogue_rl import run_features as RF
+
+
+class ExtraEncoder(nn.Module):
+    """The extra_features inputs (level cap, items, enemy buffs) as one vector: numeric features plus
+    stack-weighted sums of item embeddings per party slot and for the team."""
+
+    def __init__(self, item_dim: int = 8):
+        super().__init__()
+        self.item_emb = nn.Embedding(RF.ITEM_BUCKETS, item_dim, padding_idx=0)
+        self.out_dim = XF.GLOBAL_DIM + F.PARTY_SLOTS * (XF.MON_DIM + item_dim) + item_dim
+
+    def forward(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
+        held = (self.item_emb(batch["x_held"]) * batch["x_held_n"].unsqueeze(-1)).sum(-2)  # [n, 6, item_dim]
+        team = (self.item_emb(batch["x_team"]) * batch["x_team_n"].unsqueeze(-1)).sum(-2)  # [n, item_dim]
+        mon = torch.cat([batch["x_mon"], held], dim=-1).flatten(1)
+        return torch.cat([batch["x_glob"], mon, team], dim=-1)
 
 
 def _zero_linear(n_in: int, n_out: int) -> nn.Linear:
@@ -37,6 +54,9 @@ class BattlePolicy(nn.Module):
             nn.Linear(in_dim, hidden), nn.ReLU(),
             nn.Linear(hidden, hidden), nn.ReLU(),
         )
+        # Like abilities: zero-initialised, so older checkpoints behave unchanged (see extra_features).
+        self.extra = ExtraEncoder()
+        self.extra_proj = _zero_linear(self.extra.out_dim, hidden)
         self.policy_head = nn.Linear(hidden, F.NUM_ACTIONS)
         self.value_head = nn.Linear(hidden, 1)
         # Small initial policy logits so early behaviour is near-uniform over legal actions.
@@ -49,6 +69,8 @@ class BattlePolicy(nn.Module):
         mons = torch.cat([batch["mon"], self.species_emb(batch["species"]), moves.flatten(2)], dim=-1)
         x = torch.cat([mons.flatten(1), batch["glob"]], dim=-1)
         x = self.trunk[0](x) + self.ability_proj(self.ability_emb(batch["ability"]).flatten(1))
+        if "x_glob" in batch:
+            x = x + self.extra_proj(self.extra(batch))
         h = self.trunk[1:](x)
         logits = self.policy_head(h).masked_fill(~batch["mask"], -1e9)
         return logits, self.value_head(h).squeeze(-1)
@@ -80,6 +102,8 @@ class RunPolicy(nn.Module):
         self.cand_enc = nn.Sequential(nn.Linear(cand_in, hidden), nn.ReLU())
         self.score = nn.Sequential(nn.Linear(2 * hidden, hidden), nn.ReLU(), nn.Linear(hidden, 1))
         self.value_head = nn.Linear(hidden, 1)
+        self.extra = ExtraEncoder()
+        self.extra_proj = _zero_linear(self.extra.out_dim, hidden)
         # Learned per-item logit offset; starts at 0. Lets training seed a prior for an item the
         # behaviour-cloned start never picks (lures, see scripts/train_ppo.py --lure-prior).
         self.item_bias = nn.Embedding(RF.ITEM_BUCKETS, 1)
@@ -92,10 +116,13 @@ class RunPolicy(nn.Module):
         moves = torch.cat([batch["move"], self.move_emb(batch["moves"])], dim=-1)  # [n, 7, 4, .]
         mons = torch.cat([batch["mon"], self.species_emb(batch["species"]), moves.flatten(2)], dim=-1)
         h_mon = self.mon_enc[1](self.mon_enc[0](mons) + self.ability_proj(self.ability_emb(batch["ability"])))
-        state = self.state(torch.cat([
+        state = self.state[0](torch.cat([
             h_mon.flatten(1), batch["glob"], self.item_emb(batch["ctx_item"]),
             self.move_emb(batch["ctx_move_id"]), batch["ctx_move"],
         ], dim=-1))
+        if "x_glob" in batch:
+            state = state + self.extra_proj(self.extra(batch))
+        state = self.state[1:](state)
         # Candidate slot 0 = none; 1..7 = mon slot index + 1.
         slot_h = torch.cat([torch.zeros_like(h_mon[:, :1]), h_mon], dim=1)
         cand_mon = slot_h.gather(1, batch["cand_slot"].unsqueeze(-1).expand(-1, -1, h_mon.shape[-1]))
@@ -124,6 +151,7 @@ def encode_step(obs: dict) -> dict[str, np.ndarray]:
         _ZERO["r_"] = {k: np.zeros_like(v) for k, v in RF.encode(_DUMMY_RUN).items()}
     out = {prefix + k: v for k, v in own.items()}
     out.update({other + k: v for k, v in _ZERO[other].items()})
+    out.update(XF.encode(obs))  # shared by both halves (keys start with "x_")
     out["is_run"] = np.bool_(is_run)
     return out
 
@@ -156,6 +184,7 @@ class AgentPolicy(nn.Module):
                 continue
             idx = mask.nonzero(as_tuple=True)[0]
             sub = {k[2:]: v[idx] for k, v in batch.items() if k.startswith(prefix)}
+            sub.update({k: v[idx] for k, v in batch.items() if k.startswith("x_")})
             lg, val = net(sub)
             logits[idx, :width] = lg.to(logits.dtype)
             value[idx] = val.to(value.dtype)
@@ -173,7 +202,7 @@ class AgentPolicy(nn.Module):
 
 
 # Parameters added after checkpoints already existed; they start neutral (see _zero_linear).
-NEW_KEYS = ("ability_emb.", "ability_proj.", "item_bias.")
+NEW_KEYS = ("ability_emb.", "ability_proj.", "item_bias.", "extra.", "extra_proj.")
 
 
 def load_compatible(module: nn.Module, state: dict) -> None:

@@ -1,0 +1,27 @@
+# Weekend plan, 2026-11-06 (Fri) to 2026-11-09 (Mon): two lanes, one node each (admin limit: 2 nodes,
+# single-node jobs, not bowser). Submit with hpc/submit_lanes.sh; each lane starts after the raw-EXP
+# sweep task currently on its node:
+#   SBATCH_EXTRA="--cpus-per-task=24 --mem=44G --exclude=adrian,bowser" LANE_AFTER="A=1406_2 B=1406_3" \
+#     hpc/submit_lanes.sh hpc/sweeps/weekend-2026-11-06.txt
+#
+# All four runs use the "progress" setup from docs/pokerogue-mechanics.md and the wave-1001 review:
+#   reward: 1 per wave cleared, a flat 1.0 for losing the run, a small EXP term (0.02 per level),
+#           no other shaping; --reward-norm keeps the scale stable
+#   gamma 0.999 (looks ~1000 decisions, ~100 waves ahead instead of ~20)
+#   inputs: level cap, items, enemy buffs, boss distance (extra_features.py; always on)
+#   --max-wave 1001 (reaching it ends the episode as a success); constant LR so runs can be extended
+#   curriculum (the *-curr / base-v1 runs): frontier mode. Snapshots from wave 20 up, at most 120 waves
+#   held, starts sampled among the 30 deepest; half of new episodes start from the bank.
+# Every curriculum run has a control that differs only in having no curriculum. Compare on wave_mean,
+# gate50/gate100/... (episodes from wave 1 only), not return or v_loss.
+#
+# Lane A then B:
+#   wave-v1-curr / wave-v1-ctrl  from exp-v1-curr's weights (the best wave-50 policy so far), 30M steps
+#   wave-base-v1 / wave-base-ctrl  from scratch, 1B steps: effectively "train until stopped". These run
+#                                  all weekend; stop them with scancel, or extend/continue by resubmitting
+#                                  the same name (they resume from runs/NAME/policy.pt).
+
+A wave-v1-curr    --num-envs 20 --rollout 154 --run-policy --clearml --max-wave 1001 --total-steps 30000000 --lr 1.5e-4 --lr-schedule constant --gamma 0.999 --reward-norm --wave-reward 1.0 --team-coef 0 --damage-coef 0 --exp-coef 0.02 --faint-gameover 1.0 --init runs/exp-v1-curr/policy.pt --snapshot-waves 20- --snapshot-frontier 30 --snapshot-max-waves 120 --snapshot-capacity 32
+B wave-v1-ctrl    --num-envs 20 --rollout 154 --run-policy --clearml --max-wave 1001 --total-steps 30000000 --lr 1.5e-4 --lr-schedule constant --gamma 0.999 --reward-norm --wave-reward 1.0 --team-coef 0 --damage-coef 0 --exp-coef 0.02 --faint-gameover 1.0 --init runs/exp-v1-curr/policy.pt
+A wave-base-v1    --num-envs 20 --rollout 154 --run-policy --clearml --max-wave 1001 --total-steps 1000000000 --lr 1.5e-4 --lr-schedule constant --gamma 0.999 --reward-norm --wave-reward 1.0 --team-coef 0 --damage-coef 0 --exp-coef 0.02 --faint-gameover 1.0 --snapshot-waves 20- --snapshot-frontier 30 --snapshot-max-waves 120 --snapshot-capacity 32
+B wave-base-ctrl  --num-envs 20 --rollout 154 --run-policy --clearml --max-wave 1001 --total-steps 1000000000 --lr 1.5e-4 --lr-schedule constant --gamma 0.999 --reward-norm --wave-reward 1.0 --team-coef 0 --damage-coef 0 --exp-coef 0.02 --faint-gameover 1.0

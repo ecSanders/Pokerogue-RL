@@ -52,7 +52,7 @@ import { SpeciesId } from "#enums/species-id";
 import { TrainerType } from "#enums/trainer-type";
 import { UiMode } from "#enums/ui-mode";
 import type { EnemyPokemon, Pokemon } from "#field/pokemon";
-import { HealShopCostModifier } from "#modifiers/modifier";
+import { EnemyPersistentModifier, HealShopCostModifier, PokemonHeldItemModifier } from "#modifiers/modifier";
 import {
   FusePokemonModifierType,
   getPartyLuckValue,
@@ -1127,6 +1127,15 @@ class Sim {
     }
   }
 
+  private encodeItems() {
+    const party = this.scene.getPlayerParty();
+    return this.scene.findModifiers(() => true).map(m => ({
+      id: itemId(m.type),
+      stacks: m.getStackCount(),
+      slot: m instanceof PokemonHeldItemModifier ? party.findIndex(p => p.id === m.pokemonId) : -1,
+    }));
+  }
+
   private result(done: boolean, reason?: string) {
     const scene = this.scene;
     const battle = scene.currentBattle;
@@ -1144,6 +1153,14 @@ class Sim {
       biome: scene.arena?.biomeId,
       balls: [0, 1, 2, 3, 4].map(b => scene.pokeballCounts[b as PokeballType] ?? 0),
       luck: getPartyLuckValue(scene.getPlayerParty()),
+      // Battle EXP stops at this level (candies ignore it); see docs/pokerogue-mechanics.md.
+      levelCap: scene.getMaxExpLevel(),
+      // Player items: held items carry their party slot, team-wide items (charms, EXP Share, lures) slot -1.
+      items: this.encodeItems(),
+      // Permanent enemy buffs, one more after each 50th-wave boss.
+      enemyBuffs: scene
+        .findModifiers(m => m instanceof EnemyPersistentModifier, false)
+        .map(m => ({ id: itemId(m.type), stacks: m.getStackCount() })),
       party: scene.getPlayerParty().map(p => this.encodePokemon(p, withDamage)),
       enemies: scene.getEnemyField().map(p => this.encodePokemon(p, false)),
     };

@@ -124,6 +124,11 @@ def parse_args():
     p.add_argument("--snapshot-collect", type=float, default=0.25,
                    help="chance each wave start in --snapshot-waves is offered to the bank")
     p.add_argument("--snapshot-capacity", type=int, default=64, help="snapshots kept per wave")
+    p.add_argument("--snapshot-frontier", type=int, default=0,
+                   help="start episodes only from the N deepest waves the bank holds (0: any); with an open "
+                        "range like --snapshot-waves 20- this makes the curriculum follow the frontier")
+    p.add_argument("--snapshot-max-waves", type=int, default=None,
+                   help="most different waves the bank holds; the shallowest are dropped first")
     p.add_argument("--snapshot-seed-bank", nargs="*", default=[],
                    help="saved banks (runs/NAME/snapshots*.pkl) to fill this run's bank from at the start")
     p.add_argument("--clearml", action="store_true",
@@ -156,7 +161,10 @@ def main() -> None:
     reward_norm_state = None
     if args.resume:
         ckpt = policy.load_checkpoint(out / "policy.pt", map_location=device)
-        optimizer.load_state_dict(ckpt["optimizer"])
+        try:
+            optimizer.load_state_dict(ckpt["optimizer"])
+        except ValueError as e:  # the network gained parameters since this checkpoint (e.g. extra_features)
+            print(f"optimizer state not restored ({e}); starting it fresh", flush=True)
         first_update, global_step = ckpt["update"] + 1, ckpt["step"]
         reward_norm_state = ckpt.get("reward_norm")
         # Drop log rows written after the checkpoint; those updates are redone.
@@ -190,7 +198,8 @@ def main() -> None:
     # Start-wave curriculum: one bank per rank, shared by its envs, saved with the run for --resume.
     bank, bank_file = None, out / (f"snapshots-r{dd.rank}.pkl" if dd.enabled else "snapshots.pkl")
     if args.snapshot_waves:
-        bank = SnapshotBank(parse_waves(args.snapshot_waves), capacity=args.snapshot_capacity, seed=dd.rank)
+        bank = SnapshotBank(parse_waves(args.snapshot_waves), capacity=args.snapshot_capacity, seed=dd.rank,
+                            max_waves=args.snapshot_max_waves, frontier=args.snapshot_frontier)
         for path in ([bank_file] if args.resume and bank_file.exists() else []) + [Path(p) for p in args.snapshot_seed_bank]:
             print(f"{'rank ' + str(dd.rank) + ': ' if dd.enabled else ''}snapshot bank: "
                   f"{bank.load(path)} snapshots from {path}", flush=True)
@@ -230,7 +239,7 @@ def main() -> None:
             for eps, _, _, _ in parts:
                 for e in eps:
                     (recent_snap if e.get("start_wave", 1) > 1 else recent).append(e)
-            bank_sizes = dd.gather((len(bank), bank.waves_held()) if bank is not None else (0, 0))
+            bank_sizes = dd.gather((len(bank), bank.waves_held(), bank.deepest()) if bank is not None else (0, 0, 0))
             invalid, sim_errors = sum(p[1] for p in parts), sum(p[2] for p in parts)
             rollout_time = max(p[3] for p in parts)
             global_step += batch_size * dd.world
@@ -307,6 +316,7 @@ def main() -> None:
                 # Curriculum: the bank (summed over ranks) and episodes started from it. The stats above
                 # cover only episodes from wave 1, so they stay comparable with runs without a curriculum.
                 **({"bank": sum(b[0] for b in bank_sizes), "bank_waves": max(b[1] for b in bank_sizes),
+                    "bank_deepest": max(b[2] for b in bank_sizes),
                     "snap_episodes": len(recent_snap),
                     "snap_waves_gained": round(float(np.mean([e["wave"] - e["start_wave"] for e in recent_snap])), 2)
                     if recent_snap else None,

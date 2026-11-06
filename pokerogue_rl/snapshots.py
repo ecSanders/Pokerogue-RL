@@ -10,6 +10,11 @@ One bank is shared by the envs of a trainer process (they step in threads). It k
 snapshots per wave, a uniform sample of those offered (reservoir sampling), so later, stronger
 policies keep refreshing it. Sampling picks a wave uniformly, then a snapshot of that wave, so waves
 seen less often are practised as often as common ones.
+
+Frontier mode (an open range like "20-", with `frontier` and `max_waves`): the bank takes every wave
+from the first one up, drops the shallowest waves once it holds `max_waves` different waves, and
+samples starts among the `frontier` deepest waves it holds, so practice follows the furthest point
+the policy reaches (wave 50, then 100, 150, ...).
 """
 
 from __future__ import annotations
@@ -20,26 +25,30 @@ import threading
 from pathlib import Path
 
 
-def parse_waves(spec: str) -> tuple[int, int]:
-    """"20-45" -> (20, 45); "30" -> (30, 30)."""
-    lo, _, hi = spec.partition("-")
-    lo, hi = int(lo), int(hi or lo)
-    if not 1 < lo <= hi:
+def parse_waves(spec: str) -> tuple[int, int | None]:
+    """"20-45" -> (20, 45); "30" -> (30, 30); "20-" -> (20, None), open-ended."""
+    lo, dash, hi = spec.partition("-")
+    lo = int(lo)
+    hi = None if dash and not hi else int(hi or lo)
+    if not 1 < lo or (hi is not None and hi < lo):
         raise ValueError(f"bad wave range {spec!r}: need 1 < first <= last")
     return lo, hi
 
 
 class SnapshotBank:
-    def __init__(self, waves: tuple[int, int], capacity: int = 64, seed: int = 0):
+    def __init__(self, waves: tuple[int, int | None], capacity: int = 64, seed: int = 0,
+                 max_waves: int | None = None, frontier: int = 0):
         self.lo, self.hi = waves
         self.capacity = capacity
+        self.max_waves = max_waves
+        self.frontier = frontier
         self.by_wave: dict[int, list[dict]] = {}
         self.offered: dict[int, int] = {}  # snapshots offered per wave, for reservoir sampling
         self.rng = random.Random(seed)
         self.lock = threading.Lock()
 
     def wants(self, wave: int) -> bool:
-        return self.lo <= wave <= self.hi
+        return self.lo <= wave and (self.hi is None or wave <= self.hi)
 
     def add(self, snap: dict) -> None:
         """Offer a snapshot (from BattleEnv.snapshot). Kept with probability capacity / offered so far."""
@@ -56,17 +65,26 @@ class SnapshotBank:
                 i = self.rng.randrange(self.offered[wave])
                 if i < self.capacity:
                     kept[i] = entry
+            if self.max_waves and len(self.by_wave) > self.max_waves:
+                for w in sorted(self.by_wave)[: len(self.by_wave) - self.max_waves]:
+                    del self.by_wave[w]  # keep the deepest waves (frontier mode)
 
     def sample(self, rng: random.Random) -> dict | None:
         with self.lock:
-            waves = [w for w, kept in self.by_wave.items() if kept]
+            waves = sorted(w for w, kept in self.by_wave.items() if kept)
             if not waves:
                 return None
+            if self.frontier:
+                waves = waves[-self.frontier:]
             return rng.choice(self.by_wave[rng.choice(waves)])
 
     def __len__(self) -> int:
         with self.lock:
             return sum(len(kept) for kept in self.by_wave.values())
+
+    def deepest(self) -> int:
+        with self.lock:
+            return max((w for w, kept in self.by_wave.items() if kept), default=0)
 
     def waves_held(self) -> int:
         with self.lock:
@@ -96,4 +114,7 @@ class SnapshotBank:
                 mine.extend(kept[:room])
                 added += min(room, len(kept))
                 self.offered[wave] = self.offered.get(wave, 0) + data["offered"].get(wave, len(kept))
+            if self.max_waves and len(self.by_wave) > self.max_waves:
+                for w in sorted(self.by_wave)[: len(self.by_wave) - self.max_waves]:
+                    del self.by_wave[w]
         return added
