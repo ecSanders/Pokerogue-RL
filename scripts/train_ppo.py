@@ -133,6 +133,8 @@ def parse_args():
                    help="saved banks (runs/NAME/snapshots*.pkl) to fill this run's bank from at the start")
     p.add_argument("--clearml", action="store_true",
                    help="track the run in ClearML (needs ~/clearml.conf): args, log charts, console, checkpoints")
+    p.add_argument("--clearml-report-every", type=int, default=10,
+                   help="updates between scalar reports to ClearML (its free tier has a metrics quota)")
     p.add_argument("--clearml-upload-every", type=int, default=200,
                    help="updates between checkpoint uploads to ClearML (0: only the final one)")
     return p.parse_args()
@@ -189,7 +191,8 @@ def main() -> None:
     # exp-coef-v1 (job 1384) hung for 10+ minutes in the Adam constructor's import of torch._dynamo /
     # sympy under those hooks, holding the other rank at the weight broadcast.
     tracker = Tracker(args.clearml and dd.main, args.name, out, {**vars(args), "world_size": dd.world},
-                      resume=args.resume, upload_every=args.clearml_upload_every)
+                      resume=args.resume, upload_every=args.clearml_upload_every,
+                      report_every=args.clearml_report_every)
 
     # Rollouts run per-env threads with small-batch inference on a CPU copy (faster than GPU there).
     actor = AgentPolicy()

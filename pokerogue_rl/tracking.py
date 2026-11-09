@@ -8,6 +8,7 @@ runs/<name>/clearml_task_id and continued on --resume.
 
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 
 PROJECT = "Pokerogue-RL"
@@ -33,8 +34,11 @@ class Tracker:
     """No-op unless `enabled`. Call `log` once per update and `checkpoint` after writing policy.pt."""
 
     def __init__(self, enabled: bool, name: str, out: Path, config: dict, resume: bool = False,
-                 upload_every: int = 0):
+                 upload_every: int = 0, report_every: int = 1):
         self.task = None
+        # Every logged value counts against ClearML's metrics storage quota (the free tier ran out on
+        # 2026-11-08 after ~120k updates across runs); log.jsonl keeps every update regardless.
+        self.report_every = max(1, report_every)
         self.models = {}  # checkpoint file stem -> OutputModel
         self.upload_every = upload_every
         self.offset = 0
@@ -61,7 +65,7 @@ class Tracker:
         self.logger = self.task.get_logger()
 
     def log(self, row: dict, iteration: int) -> None:
-        if not self.task:
+        if not self.task or iteration % self.report_every:
             return
         for key, value in row.items():
             if key in ("update", "step") or not isinstance(value, (int, float)) or isinstance(value, bool):
@@ -79,7 +83,21 @@ class Tracker:
         self.models[path.stem].update_weights(weights_filename=str(path), iteration=update, auto_delete_file=False,
                                               async_enable=False)  # a background upload can be cut off at exit
 
-    def close(self) -> None:
-        if self.task:
-            self.task.flush(wait_for_uploads=True)
-            self.task.close()
+    def close(self, timeout: float = 60) -> None:
+        """Flush and close, but give up after `timeout` seconds: when ClearML is over quota or
+        unreachable, its retries must not hold up a job that is stopping to requeue."""
+        if not self.task:
+            return
+
+        def _close():
+            try:
+                self.task.flush(wait_for_uploads=True)
+                self.task.close()
+            except Exception as e:  # noqa: BLE001 - tracking must never break training
+                print(f"[clearml] close failed: {e!r}", flush=True)
+
+        t = threading.Thread(target=_close, daemon=True)
+        t.start()
+        t.join(timeout)
+        if t.is_alive():
+            print(f"[clearml] close still running after {timeout:.0f}s; leaving it", flush=True)

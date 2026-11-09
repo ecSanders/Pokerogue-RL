@@ -2,7 +2,7 @@
 # Slurm job body: one PPO run. Submit with hpc/submit.sh, not sbatch directly.
 #
 # Arguments are "NAME [train_ppo.py args...]", or come from line SLURM_ARRAY_TASK_ID of SWEEP_FILE.
-# Resumes from runs/NAME/policy.pt if it exists. Five minutes before the time limit (or on
+# Resumes from runs/NAME/policy.pt if it exists. Ten minutes before the time limit (or on
 # preemption) Slurm sends USR1; the job then stops training and requeues itself to continue.
 # With several nodes (submit.sh --nodes N) srun starts one trainer per node and they train one model.
 set -euo pipefail
@@ -56,7 +56,13 @@ fi
 requeue() {
     echo "Time limit or preemption: stopping and requeueing"
     kill -TERM "$train_pid" 2>/dev/null || true
-    wait "$train_pid" || true
+    # Give the trainer up to 2 minutes to save and close, then requeue regardless: on 2026-11-09 a slow
+    # shutdown (ClearML retrying uploads over its quota) outlasted the warning and the job timed out
+    # instead of requeueing. Checkpoints are written every 10 updates, so little is lost either way.
+    for _ in $(seq 120); do
+        kill -0 "$train_pid" 2>/dev/null || break
+        sleep 1
+    done
     scontrol requeue "$SLURM_JOB_ID"  # an array task has its own job id
     exit 0
 }

@@ -28,7 +28,7 @@ if [[ "${1:-}" == "--nodes" ]]; then
     shift 2
 fi
 
-flags=(--cpus-per-task="$CPUS" --mem="$MEM" --time="$TIME" --requeue --signal=B:USR1@300
+flags=(--cpus-per-task="$CPUS" --mem="$MEM" --time="$TIME" --requeue --signal=B:USR1@600
        --open-mode=append  # a requeued job keeps its earlier log
        --nodes="$nodes" --ntasks-per-node=1)
 [[ -n "${SLURM_ACCOUNT:-}" ]] && flags+=(--account="$SLURM_ACCOUNT")

@@ -64,7 +64,7 @@ they train one shared model (synchronous data-parallel PPO, `pokerogue_rl/distri
 
 ## Time limits and preemption
 
-Jobs run with `--requeue`. Five minutes before the time limit, Slurm signals the job, which
+Jobs run with `--requeue`. Ten minutes before the time limit, Slurm signals the job, which
 stops training and requeues itself. When the job starts again it finds `runs/NAME/policy.pt` and
 passes `--resume`, so it continues from that checkpoint. Checkpoints are written every 10
 updates (about 25 s) by write-then-rename, so a kill loses at most that much work. Resubmitting
