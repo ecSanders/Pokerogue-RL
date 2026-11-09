@@ -150,7 +150,8 @@ class BattleEnv:
     def __init__(self, env_id: int, seed_prefix: str = "train", max_wave: int = 500,
                  reward: RewardConfig | None = None, sim: SimClient | None = None,
                  policy_kinds: tuple[str, ...] = BATTLE_KINDS, double_chance: float | None = None,
-                 bank: SnapshotBank | None = None, snapshot_frac: float = 0.0, snapshot_collect: float = 1.0):
+                 bank: SnapshotBank | None = None, snapshot_frac: float = 0.0, snapshot_collect: float = 1.0,
+                 snapshot_fresh_only: bool = False):
         """`sim`: a client from a shared simulator group; launches its own simulator if omitted.
         `double_chance`: more double battles for practice (see SimClient.reset).
         `bank`: start-wave curriculum (see snapshots.py). Each wave start in the bank's range is offered
@@ -159,6 +160,8 @@ class BattleEnv:
         self.bank = bank
         self.snapshot_frac = snapshot_frac
         self.snapshot_collect = snapshot_collect
+        # Only episodes that started at wave 1 feed the bank and its death record (see snapshots.py).
+        self.snapshot_fresh_only = snapshot_fresh_only
         self.rng = random.Random(f"{seed_prefix}-{env_id}")
         self.double_chance = double_chance
         self.in_double = False  # last command was in a double battle
@@ -337,6 +340,8 @@ class BattleEnv:
         self.episode_steps += 1
         info = {"invalid": resp["info"].get("invalidAction", False)}
         if done:
+            if self.bank is not None and game_over and self.start_wave == 1:
+                self.bank.note_death(obs["wave"])
             if self.tracked:
                 info["episode"] = {"wave": obs["wave"], "reason": resp["info"]["reason"],
                                    "return": self.episode_return, "steps": self.episode_steps,
@@ -348,6 +353,7 @@ class BattleEnv:
             self.obs = obs
             self.at_wave_start = obs["wave"] != prev["wave"] and self._clean_wave_start
             if (self.at_wave_start and self.bank is not None and self.bank.wants(obs["wave"])
+                    and not (self.snapshot_fresh_only and self.start_wave > 1)
                     and self.rng.random() < self.snapshot_collect):
                 try:
                     snap = self.snapshot()

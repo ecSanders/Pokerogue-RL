@@ -127,6 +127,12 @@ def parse_args():
     p.add_argument("--snapshot-frontier", type=int, default=0,
                    help="start episodes only from the N deepest waves the bank holds (0: any); with an open "
                         "range like --snapshot-waves 20- this makes the curriculum follow the frontier")
+    p.add_argument("--snapshot-sampling", choices=["uniform", "deaths"], default="uniform",
+                   help="deaths: start a few waves before where recent episodes from wave 1 died "
+                        "(see pokerogue_rl/snapshots.py); uniform: any held wave (or --snapshot-frontier)")
+    p.add_argument("--snapshot-lead", type=int, default=5, help="deaths sampling: start this many waves early")
+    p.add_argument("--snapshot-fresh-only", action="store_true",
+                   help="only episodes that started at wave 1 feed the bank (no chaining of snapshots)")
     p.add_argument("--snapshot-max-waves", type=int, default=None,
                    help="most different waves the bank holds; the shallowest are dropped first")
     p.add_argument("--snapshot-seed-bank", nargs="*", default=[],
@@ -202,11 +208,13 @@ def main() -> None:
     bank, bank_file = None, out / (f"snapshots-r{dd.rank}.pkl" if dd.enabled else "snapshots.pkl")
     if args.snapshot_waves:
         bank = SnapshotBank(parse_waves(args.snapshot_waves), capacity=args.snapshot_capacity, seed=dd.rank,
-                            max_waves=args.snapshot_max_waves, frontier=args.snapshot_frontier)
+                            max_waves=args.snapshot_max_waves, frontier=args.snapshot_frontier,
+                            sampling=args.snapshot_sampling, lead=args.snapshot_lead)
         for path in ([bank_file] if args.resume and bank_file.exists() else []) + [Path(p) for p in args.snapshot_seed_bank]:
             print(f"{'rank ' + str(dd.rank) + ': ' if dd.enabled else ''}snapshot bank: "
                   f"{bank.load(path)} snapshots from {path}", flush=True)
     envs = VecBattleEnv(args.num_envs, bank=bank, snapshot_frac=args.snapshot_frac,
+                        snapshot_fresh_only=args.snapshot_fresh_only,
                         snapshot_collect=args.snapshot_collect, double_envs=args.double_envs, double_chance=args.double_chance,
                         seed_prefix=f"{args.name}-r{dd.rank}" if dd.enabled else args.name, max_wave=args.max_wave,
                         reward=RewardConfig(gamma=args.gamma, wave_reward=args.wave_reward, team_coef=args.team_coef,
@@ -320,6 +328,8 @@ def main() -> None:
                 # cover only episodes from wave 1, so they stay comparable with runs without a curriculum.
                 **({"bank": sum(b[0] for b in bank_sizes), "bank_waves": max(b[1] for b in bank_sizes),
                     "bank_deepest": max(b[2] for b in bank_sizes),
+                    **({f"death_p{q}": v for q, v in zip((50, 90), bank.death_quantiles())}
+                       if bank.death_quantiles() else {}),
                     "snap_episodes": len(recent_snap),
                     "snap_waves_gained": round(float(np.mean([e["wave"] - e["start_wave"] for e in recent_snap])), 2)
                     if recent_snap else None,

@@ -1,0 +1,14 @@
+# Deaths curriculum vs control (2026-11-09), both from a frozen copy of wave-base-v1 at 228.5M steps
+# (runs/_init/wave-base-v1-228536000.pt; mean wave ~52, clears wave 50 ~86%, reached 250 twice).
+#
+# The weekend's frontier curriculum (wave-v1-curr, wave-base-v1) did no better than its controls: snapshot
+# starts fed the bank, so it chained to waves 500-750 while episodes from wave 1 died around 50-250.
+# Deaths mode (pokerogue_rl/snapshots.py): only episodes from wave 1 feed the bank (--snapshot-fresh-only),
+# and each start picks a recent wave-1 episode's death wave and starts 5 waves before it
+# (--snapshot-sampling deaths), so practice lands where runs actually die, in proportion (Eternatus at 250).
+# Same progress setup as the base runs. Compare on episodes from wave 1 (wave_mean, gate100/150/200/250).
+# Submit as two lanes (single-node jobs, at most 2 nodes, not bowser):
+#   SBATCH_EXTRA="--cpus-per-task=24 --mem=44G --exclude=adrian,bowser" hpc/submit_lanes.sh hpc/sweeps/wave-deaths.txt
+
+A wave-deaths-curr  --num-envs 20 --rollout 154 --run-policy --clearml --max-wave 1001 --total-steps 50000000 --lr 1.5e-4 --lr-schedule constant --gamma 0.999 --reward-norm --wave-reward 1.0 --team-coef 0 --damage-coef 0 --exp-coef 0.02 --faint-gameover 1.0 --init runs/_init/wave-base-v1-228536000.pt --snapshot-waves 20- --snapshot-sampling deaths --snapshot-fresh-only --snapshot-capacity 16
+B wave-deaths-ctrl  --num-envs 20 --rollout 154 --run-policy --clearml --max-wave 1001 --total-steps 50000000 --lr 1.5e-4 --lr-schedule constant --gamma 0.999 --reward-norm --wave-reward 1.0 --team-coef 0 --damage-coef 0 --exp-coef 0.02 --faint-gameover 1.0 --init runs/_init/wave-base-v1-228536000.pt

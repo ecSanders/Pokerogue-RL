@@ -15,13 +15,23 @@ Frontier mode (an open range like "20-", with `frontier` and `max_waves`): the b
 from the first one up, drops the shallowest waves once it holds `max_waves` different waves, and
 samples starts among the `frontier` deepest waves it holds, so practice follows the furthest point
 the policy reaches (wave 50, then 100, 150, ...).
+
+Deaths mode (sampling="deaths", 2026-11-09): frontier mode let snapshot-started episodes feed the bank,
+so the frontier ratcheted to waves 500-750 by chaining segments (each gaining ~2 waves) while episodes
+from wave 1 still died around 50-250, and its runs did no better than their no-curriculum controls.
+In deaths mode the env feeds the bank only from episodes that started at wave 1, records where those
+episodes die (`note_death`), and each start picks a recent death wave d and starts at the deepest
+snapshot at or before d - lead. Starts land just before where the policy really dies, in proportion
+to how often it dies there (boss walls like Eternatus at 250 get the most practice).
 """
 
 from __future__ import annotations
 
+import collections
 import pickle
 import random
 import threading
+from bisect import bisect_right
 from pathlib import Path
 
 
@@ -37,11 +47,17 @@ def parse_waves(spec: str) -> tuple[int, int | None]:
 
 class SnapshotBank:
     def __init__(self, waves: tuple[int, int | None], capacity: int = 64, seed: int = 0,
-                 max_waves: int | None = None, frontier: int = 0):
+                 max_waves: int | None = None, frontier: int = 0, sampling: str = "uniform", lead: int = 5,
+                 deaths_window: int = 1000):
+        if sampling not in ("uniform", "deaths"):
+            raise ValueError(f"unknown sampling {sampling!r}")
         self.lo, self.hi = waves
         self.capacity = capacity
         self.max_waves = max_waves
         self.frontier = frontier
+        self.sampling = sampling
+        self.lead = lead
+        self.deaths: collections.deque[int] = collections.deque(maxlen=deaths_window)
         self.by_wave: dict[int, list[dict]] = {}
         self.offered: dict[int, int] = {}  # snapshots offered per wave, for reservoir sampling
         self.rng = random.Random(seed)
@@ -69,11 +85,29 @@ class SnapshotBank:
                 for w in sorted(self.by_wave)[: len(self.by_wave) - self.max_waves]:
                     del self.by_wave[w]  # keep the deepest waves (frontier mode)
 
+    def note_death(self, wave: int) -> None:
+        """Record the wave an episode from wave 1 was lost on (deaths mode)."""
+        with self.lock:
+            self.deaths.append(wave)
+
+    def death_quantiles(self, qs=(0.5, 0.9)) -> list[int] | None:
+        with self.lock:
+            d = sorted(self.deaths)
+        return [d[min(len(d) - 1, int(q * len(d)))] for q in qs] if d else None
+
     def sample(self, rng: random.Random) -> dict | None:
+        """A snapshot to start from, or None for a fresh start (deaths mode: no snapshot before the
+        chosen death wave yet)."""
         with self.lock:
             waves = sorted(w for w, kept in self.by_wave.items() if kept)
             if not waves:
                 return None
+            if self.sampling == "deaths":
+                if not self.deaths:
+                    return None
+                target = rng.choice(self.deaths) - self.lead
+                i = bisect_right(waves, target)
+                return rng.choice(self.by_wave[waves[i - 1]]) if i else None
             if self.frontier:
                 waves = waves[-self.frontier:]
             return rng.choice(self.by_wave[rng.choice(waves)])
@@ -93,7 +127,7 @@ class SnapshotBank:
     def save(self, path: Path) -> None:
         """Write then rename, so a job killed mid-save keeps the previous bank."""
         with self.lock:
-            data = {"by_wave": self.by_wave, "offered": self.offered}
+            data = {"by_wave": self.by_wave, "offered": self.offered, "deaths": list(self.deaths)}
             tmp = path.with_suffix(path.suffix + ".tmp")
             with tmp.open("wb") as f:
                 pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
@@ -117,4 +151,5 @@ class SnapshotBank:
             if self.max_waves and len(self.by_wave) > self.max_waves:
                 for w in sorted(self.by_wave)[: len(self.by_wave) - self.max_waves]:
                     del self.by_wave[w]
+            self.deaths.extend(data.get("deaths", []))
         return added
