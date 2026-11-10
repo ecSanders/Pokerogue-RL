@@ -17,3 +17,8 @@ B wave-deaths-ctrl  --num-envs 20 --rollout 154 --run-policy --clearml --max-wav
 # hpc/sweeps/weekend-2026-11-06.txt (job.sh adds --resume since runs/NAME/policy.pt exists).
 A wave-base-v1    --num-envs 20 --rollout 154 --run-policy --clearml --max-wave 1001 --total-steps 1000000000 --lr 1.5e-4 --lr-schedule constant --gamma 0.999 --reward-norm --wave-reward 1.0 --team-coef 0 --damage-coef 0 --exp-coef 0.02 --faint-gameover 1.0 --snapshot-waves 20- --snapshot-frontier 30 --snapshot-max-waves 120 --snapshot-capacity 32
 B wave-base-ctrl  --num-envs 20 --rollout 154 --run-policy --clearml --max-wave 1001 --total-steps 1000000000 --lr 1.5e-4 --lr-schedule constant --gamma 0.999 --reward-norm --wave-reward 1.0 --team-coef 0 --damage-coef 0 --exp-coef 0.02 --faint-gameover 1.0
+
+# 2026-11-10: the pair finished. wave-deaths-curr ended ahead (last 10M: mean wave 55.0 vs 53.2, wave 250 reached
+# 23x vs 6x, first Eternatus clear). Continued to 150M steps (resumes runs/wave-deaths-curr; --init is ignored on
+# resume) on the node freed by pausing wave-base-ctrl (paused at update 45650, 140.6M steps):
+#   SBATCH_EXTRA="--cpus-per-task=24 --mem=44G --exclude=adrian,bowser" hpc/submit.sh wave-deaths-curr <same args, --total-steps 150000000>
