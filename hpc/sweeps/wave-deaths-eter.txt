@@ -1,0 +1,12 @@
+# Eternatus practice (2026-11-13): continue the wave-deaths-curr policy with deliberate wave-250 practice.
+#
+# wave-deaths-curr (deaths curriculum, 150M steps) is the only run to beat Eternatus at wave 250 (3 of 324
+# arrivals from wave 1) and to reach wave 300. Episodes from wave 1 rarely reach 250 (~1-2%), so deaths
+# sampling rarely practises it. --snapshot-focus 250 --snapshot-focus-frac 0.25: a quarter of snapshot starts
+# begin 1-10 waves before wave 250; the rest follow recent death waves as before.
+# Starts from frozen copies of wave-deaths-curr's final weights and bank (runs/_init/), so the original run's
+# record stays clean. Otherwise the same settings. Watch snap_gate250 (Eternatus clear rate from practice
+# starts) and gate250 (from wave 1).
+#   SBATCH_EXTRA="--cpus-per-task=24 --mem=44G --exclude=adrian,bowser" hpc/submit_lanes.sh hpc/sweeps/wave-deaths-eter.txt
+
+A wave-deaths-eter  --num-envs 20 --rollout 154 --run-policy --clearml --max-wave 1001 --total-steps 150000000 --lr 1.5e-4 --lr-schedule constant --gamma 0.999 --reward-norm --wave-reward 1.0 --team-coef 0 --damage-coef 0 --exp-coef 0.02 --faint-gameover 1.0 --init runs/_init/wave-deaths-curr-149999080.pt --snapshot-waves 20- --snapshot-sampling deaths --snapshot-fresh-only --snapshot-capacity 16 --snapshot-focus 250 --snapshot-focus-frac 0.25 --snapshot-seed-bank runs/_init/wave-deaths-curr-149999080-snapshots.pkl

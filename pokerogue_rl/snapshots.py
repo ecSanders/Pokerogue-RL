@@ -23,6 +23,11 @@ In deaths mode the env feeds the bank only from episodes that started at wave 1,
 episodes die (`note_death`), and each start picks a recent death wave d and starts at the deepest
 snapshot at or before d - lead. Starts land just before where the policy really dies, in proportion
 to how often it dies there (boss walls like Eternatus at 250 get the most practice).
+
+Focus (focus=250, focus_frac=0.25, 2026-11-13): few episodes from wave 1 even reach Eternatus (~1-2%),
+so deaths there are rare and so is practice. A `focus_frac` share of starts instead begins 1 to
+`focus_lead` waves before the focus wave (the deepest held snapshot at or below that), so a wall the
+policy rarely reaches still gets steady practice.
 """
 
 from __future__ import annotations
@@ -48,7 +53,8 @@ def parse_waves(spec: str) -> tuple[int, int | None]:
 class SnapshotBank:
     def __init__(self, waves: tuple[int, int | None], capacity: int = 64, seed: int = 0,
                  max_waves: int | None = None, frontier: int = 0, sampling: str = "uniform", lead: int = 5,
-                 deaths_window: int = 1000):
+                 deaths_window: int = 1000, focus: int | None = None, focus_frac: float = 0.0,
+                 focus_lead: int = 10):
         if sampling not in ("uniform", "deaths"):
             raise ValueError(f"unknown sampling {sampling!r}")
         self.lo, self.hi = waves
@@ -58,6 +64,7 @@ class SnapshotBank:
         self.sampling = sampling
         self.lead = lead
         self.deaths: collections.deque[int] = collections.deque(maxlen=deaths_window)
+        self.focus, self.focus_frac, self.focus_lead = focus, focus_frac, focus_lead
         self.by_wave: dict[int, list[dict]] = {}
         self.offered: dict[int, int] = {}  # snapshots offered per wave, for reservoir sampling
         self.rng = random.Random(seed)
@@ -102,6 +109,10 @@ class SnapshotBank:
             waves = sorted(w for w, kept in self.by_wave.items() if kept)
             if not waves:
                 return None
+            if self.focus and rng.random() < self.focus_frac:
+                i = bisect_right(waves, self.focus - rng.randint(1, self.focus_lead))
+                if i:
+                    return rng.choice(self.by_wave[waves[i - 1]])
             if self.sampling == "deaths":
                 if not self.deaths:
                     return None

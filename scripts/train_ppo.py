@@ -131,6 +131,10 @@ def parse_args():
                    help="deaths: start a few waves before where recent episodes from wave 1 died "
                         "(see pokerogue_rl/snapshots.py); uniform: any held wave (or --snapshot-frontier)")
     p.add_argument("--snapshot-lead", type=int, default=5, help="deaths sampling: start this many waves early")
+    p.add_argument("--snapshot-focus", type=int, default=None,
+                   help="a wave to practise on purpose, e.g. 250 (Eternatus): --snapshot-focus-frac of snapshot "
+                        "starts begin 1-10 waves before it")
+    p.add_argument("--snapshot-focus-frac", type=float, default=0.25)
     p.add_argument("--snapshot-fresh-only", action="store_true",
                    help="only episodes that started at wave 1 feed the bank (no chaining of snapshots)")
     p.add_argument("--snapshot-max-waves", type=int, default=None,
@@ -209,7 +213,8 @@ def main() -> None:
     if args.snapshot_waves:
         bank = SnapshotBank(parse_waves(args.snapshot_waves), capacity=args.snapshot_capacity, seed=dd.rank,
                             max_waves=args.snapshot_max_waves, frontier=args.snapshot_frontier,
-                            sampling=args.snapshot_sampling, lead=args.snapshot_lead)
+                            sampling=args.snapshot_sampling, lead=args.snapshot_lead,
+                            focus=args.snapshot_focus, focus_frac=args.snapshot_focus_frac)
         for path in ([bank_file] if args.resume and bank_file.exists() else []) + [Path(p) for p in args.snapshot_seed_bank]:
             print(f"{'rank ' + str(dd.rank) + ': ' if dd.enabled else ''}snapshot bank: "
                   f"{bank.load(path)} snapshots from {path}", flush=True)
