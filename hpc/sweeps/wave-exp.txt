@@ -9,3 +9,6 @@
 #   SBATCH_EXTRA="--cpus-per-task=24 --mem=44G --exclude=adrian,bowser" hpc/submit_lanes.sh hpc/sweeps/wave-exp.txt
 
 A wave-exp-v1  --num-envs 20 --rollout 154 --run-policy --clearml --max-wave 1001 --total-steps 1000000000 --lr 1.5e-4 --lr-schedule constant --gamma 0.999 --reward-norm --wave-reward 1.0 --team-coef 0 --damage-coef 0 --exp-coef 0.3 --faint-gameover 1.0
+
+# 2026-11-13: submitted ahead of wave-base-v1's resume (job 1517), which now waits for wave-deaths-eter (1515) to
+# finish and takes its node; this keeps at most 2 jobs running.
